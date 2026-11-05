@@ -106,7 +106,7 @@ static DNSServer  gDns;
 static bool       gDnsStarted        = false;
 
 static char       gJsonBuf[JSON_BUF_SZ];
-static char       gAuthPass[33] = "esp32admin";
+static char       gAuthPass[33] = "12345678";
 
 static uint16_t crc16(const uint8_t* data, size_t len) {
   uint16_t crc = 0xFFFF;
@@ -129,7 +129,7 @@ static void setDefaults(Config& c) {
   c.magic = CFG_MAGIC;
   c.version = CFG_VERSION;
 
-  strncpy(c.apSsid, "ESP32-Config", sizeof(c.apSsid) - 1);
+  strncpy(c.apSsid, "ESP32-BME280", sizeof(c.apSsid) - 1);
   strncpy(c.apPass, "12345678", sizeof(c.apPass) - 1);
   c.apChannel = 6;
   c.apHidden  = 0;
@@ -1487,7 +1487,3 @@ void loop() {
     digitalWrite(PIN_LED, ledState ? HIGH : LOW);
   }
 }
-
-
-
-
