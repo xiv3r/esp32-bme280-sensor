@@ -1,71 +1,138 @@
-## Components
+# Simple Instructions — ESP32 BME280 with Relay (GPIO 25)
 
-- **ESP32 DevKit** (30-pin or 38-pin, any ESP32-WROOM / WROVER board)
-- **BME280 breakout** (I²C version — the one with 4 pins: VIN, GND, SCL, SDA)
-- **BOOT button** — already on the board (GPIO0, no wiring needed)
-- **LED** — already on the board (GPIO2, no wiring needed)
-- **4 jumper wires**
+## 1. What you need
 
----
+**Hardware**
+- ESP32 dev board
+- BME280 sensor (I2C)
+- 1-channel relay module (with driver — most modules have one)
+- Jumper wires
+- 10 kΩ resistor (important, see step 6)
 
-## Wiring Table
-
-| BME280 pin | ESP32 pin | Notes |
-|------------|-----------|-------|
-| **VIN / VCC** | **3V3** | ⚠️ Use **3.3 V**, not 5 V. BME280 is 3.3 V only. |
-| **GND** | **GND** | Any GND pin works. |
-| **SCL** | **GPIO 22** | I²C clock (`PIN_I2C_SCL` in firmware). |
-| **SDA** | **GPIO 21** | I²C data (`PIN_I2C_SDA` in firmware). |
+**Software**
+- Arduino IDE (or PlatformIO)
+- ESP32 board package installed
+- Libraries: `Adafruit BME280 Library`, `Adafruit Unified Sensor`
 
 ---
 
-## Notes
+## 2. Wiring
 
-### Power
-- The BME280 module runs on **3.3 V**. Some breakout boards have a 5 V-tolerant regulator + level shifter, but the bare chip is 3.3 V only — **always use 3V3** to be safe.
-- The ESP32's onboard 3.3 V regulator easily handles the BME280's ~0.7 mA.
+### BME280 → ESP32
 
-### I²C address
-- The firmware tries **0x76** first, then **0x77**.
-- Most modules ship at **0x76** (SDO pin pulled low).
-- If your module has an SDO pin, leave it floating or tie to GND for 0x76, tie to 3V3 for 0x77. The firmware auto-detects either.
+| BME280 | ESP32 |
+|---|---|
+| VIN / VCC | 3V3 |
+| GND | GND |
+| SDA | GPIO 21 |
+| SCL | GPIO 22 |
 
-### Pull-ups
-- Most BME280 breakouts have **onboard 4.7 kΩ pull-ups** on SCL and SDA. **No external resistors needed.**
-- If you're using a bare BME280 chip (not a breakout), add 4.7 kΩ from SDA→3V3 and SCL→3V3.
+### Relay module → ESP32
 
-### No external components needed
-- **BOOT button** (GPIO0) is already on the board — hold 5 s to factory reset (per `FACTORY_HOLD_MS`).
-- **Status LED** (GPIO2) is already on the board — blinks once per second.
-- **No buttons, no LEDs, no resistors** to wire externally.
+| Relay module | ESP32 |
+|---|---|
+| VCC | 5V (or 3V3 — check your module) |
+| GND | GND |
+| IN | **GPIO 25** |
 
-### Cable length
-- Keep I²C wires **short** (< 30 cm) to avoid noise. For longer runs, lower the clock — the firmware already uses 100 kHz (`Wire.setClock(100000)`).
+**Important:** add a **10 kΩ resistor from GPIO 25 to GND**. This keeps the relay OFF during boot/reset. Without it, the relay may click on for a moment when the ESP32 powers up.
 
 ---
 
-## Quick Test After Wiring
+## 3. Flash the firmware
 
-1. Connect USB → flash firmware.
-2. The board creates a WiFi AP named **`ESP32-Config`** with password **`12345678`** (defaults).
-3. Connect your phone/PC to that AP.
-4. Open **http://192.168.4.1** → log in with **`admin` / `esp32admin`**.
-5. Dashboard should show **"Sensor OK at 0x76"** (or 0x77) and live temperature / humidity / pressure.
+1. Open `v3-esp32-gpio25.txt` in Arduino IDE (save it as `.ino` first if needed).
+2. Select your board: **Tools → Board → ESP32 Dev Module**.
+3. Select the correct COM port.
+4. Click **Upload**.
 
-If it says **"Sensor not detected"**, check:
-- VIN is on **3V3**, not 5 V or VIN.
-- SDA is on **GPIO21**, SCL on **GPIO22** (not swapped).
-- Wires are firmly seated.
+> ⚠️ **First boot after upgrade from v2:** WiFi settings are reset to defaults. You will need to reconfigure WiFi. This is normal.
 
 ---
 
-## Bill of Materials
+## 4. First-time setup
 
-| Item | Qty |
-|------|-----|
-| ESP32 DevKit | 1 |
-| BME280 I²C breakout | 1 |
-| Jumper wires (female–female) | 4 |
-| USB cable | 1 |
+1. Power the ESP32.
+2. On your phone or laptop, connect to WiFi **`ESP32-Config`** (password **`12345678`**).
+3. A captive-portal page should open. If not, open a browser and go to **`http://192.168.4.1`**.
+4. Log in with:
+   - **Username:** `admin`
+   - **Password:** `esp32admin`
+5. Go to the **WiFi STA** tab → enter your home WiFi name and password → **Apply STA** → **Reboot**.
 
-**Total external wiring: 4 wires.**
+Now the ESP32 is on your home network. You can reach it at its new IP address, or reconnect to `ESP32-Config` if you prefer.
+
+---
+
+## 5. Configure the thresholds
+
+1. Open the **Thresholds** tab.
+2. Set min/max for **Temperature**, **Humidity**, **Pressure**.
+3. Click **Save Thresholds**.
+4. The dashboard cards turn **yellow** when a value is out of range.
+
+---
+
+## 6. Configure the relay
+
+Still on the **Thresholds** tab, scroll to **Relay (GPIO 25)**:
+
+| Option | What it does |
+|---|---|
+| **Relay enabled** | Turn the relay feature on/off |
+| **Logic** | **OR** = relay ON if *any* checked metric is out of range. **AND** = relay ON only if *all* checked metrics are out of range |
+| **React to temperature / humidity / pressure** | Pick which metrics drive the relay |
+| **Active-low relay** | Set to **Yes** if your relay module turns ON when the pin is LOW (most cheap modules do). Set to **No** if it turns ON when the pin is HIGH |
+
+Click **Save Relay Settings**.
+
+> **Tip:** If you don't know whether your relay is active-low or active-high, enable it with temperature selected and set a threshold you can easily cross (e.g. temp max = 25 °C). Touch the BME280 with your finger — if the relay clicks ON when the dashboard shows an alert, your invert setting is correct.
+
+---
+
+## 7. How the relay behaves
+
+- Turns **ON** the moment a selected sensor value crosses a threshold (matches the dashboard alert exactly).
+- Turns **OFF** only when the value comes back **inside** the range by a small safety margin (0.5 °C / 1 %RH / 0.5 hPa). This prevents clicking on/off when the value hovers right at the threshold.
+- If the sensor is unplugged, the relay **holds its last state** (it does not toggle randomly).
+- The relay is **independent of the "Alerts" enabled switch**. You can have the relay working with dashboard warnings turned off.
+
+---
+
+## 8. Common tasks
+
+### Change the admin password
+**System** tab → **Change Admin Password** → enter new password (min 8 characters) → **Change Password** → reload the page and log in with the new password.
+
+### Reboot the ESP32
+**System** tab → **Reboot** button.
+
+### Factory reset (erase everything)
+Two ways:
+- **System** tab → **Factory Reset** → type `RESET` → confirm.
+- Or hold the **BOOT button** on the ESP32 for **5 seconds**.
+
+After factory reset, the ESP32 returns to `ESP32-Config` / `12345678` and admin `admin` / `esp32admin`.
+
+---
+
+## 9. Quick troubleshooting
+
+| Problem | Fix |
+|---|---|
+| Can't see `ESP32-Config` WiFi | Wait 30 s after power on, or check USB power is enough |
+| Web page doesn't load | Try `http://192.168.4.1` directly. Make sure you're connected to the ESP32's WiFi |
+| Dashboard shows "Sensor not detected" | Check BME280 wiring: SDA→21, SCL→22, VCC→3V3, GND→GND |
+| Relay clicks ON at boot then OFF | Normal — add the 10 kΩ pull-down resistor (step 2) |
+| Relay never turns ON | Check **Relay enabled = Yes**, at least one metric selected, and the invert setting matches your module |
+| Relay ON when value looks OK | You have the invert setting wrong — try the opposite |
+| Relay flickering at threshold | Increase the gap between min and max thresholds slightly |
+| Forgot admin password | Factory reset (step 8), then log in with default `admin` / `esp32admin` |
+
+---
+
+## 10. Safety note
+
+GPIO 25 is **3.3 V logic**. If your relay module expects 5 V on the IN pin, confirm it accepts 3.3 V — most modules with an opto-isolator do. If yours does not, add a level shifter.
+
+**Never** connect the relay coil directly to GPIO 25. Use a relay **module** (which has a transistor driver), never a bare relay coil.
