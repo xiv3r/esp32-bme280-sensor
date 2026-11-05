@@ -955,7 +955,6 @@ static bool checkAuth() {
 }
 
 static void sendHtml() {
-  if (!checkAuth()) return;
   gServer.sendHeader("Cache-Control", "no-store");
   gServer.send_P(200, "text/html", PAGE_HTML);
 }
@@ -1325,28 +1324,59 @@ static void handleAuth() {
   if (!jsonGetStr(body, "pass", pass) || pass.length() < 8 || pass.length() > 32) {
     sendJsonErr("bad pass"); return;
   }
-  strncpy(gAuthPass, pass.c_str(), sizeof(gAuthPass) - 1);
-  gAuthPass[32] = 0;
+
+  char oldPass[33];
+  strncpy(oldPass, gAuthPass, sizeof(oldPass) - 1);
+  oldPass[sizeof(oldPass) - 1] = 0;
+
+  char newPass[33];
+  strncpy(newPass, pass.c_str(), sizeof(newPass) - 1);
+  newPass[sizeof(newPass) - 1] = 0;
+
   gPrefs.begin(CFG_NS, false);
-  gPrefs.putString(CFG_KEY_AUTH, gAuthPass);
+  size_t written = gPrefs.putString(CFG_KEY_AUTH, newPass);
+  gPrefs.end();
+
+  if (written != strlen(newPass)) {
+    strncpy(gAuthPass, oldPass, sizeof(gAuthPass) - 1);
+    gAuthPass[sizeof(gAuthPass) - 1] = 0;
+    sendJsonErr("nvs write failed");
+    return;
+  }
+
+  strncpy(gAuthPass, newPass, sizeof(gAuthPass) - 1);
+  gAuthPass[sizeof(gAuthPass) - 1] = 0;
   sendJsonOk();
 }
 
 static void handleCaptive() {
-  gServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+  IPAddress ap = WiFi.softAPIP();
+  if (ap == IPAddress(0, 0, 0, 0)) ap = IPAddress(192, 168, 4, 1);
+  gServer.sendHeader("Location", String("http://") + ap.toString() + "/", true);
   gServer.send(302, "text/plain", "");
 }
 
 static void handleNotFound() {
-  String host = gServer.hostHeader();
-  String apIp = WiFi.softAPIP().toString();
-  String staIp = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
-  if (host != apIp && (staIp.length() == 0 || host != staIp)) {
-    gServer.sendHeader("Location", String("http://") + apIp + "/", true);
-    gServer.send(302, "text/plain", "");
+  IPAddress apAddr = WiFi.softAPIP();
+  if (apAddr == IPAddress(0, 0, 0, 0)) apAddr = IPAddress(192, 168, 4, 1);
+
+  String host  = gServer.hostHeader();
+  String apIp  = apAddr.toString();
+  String staIp = (WiFi.status() == WL_CONNECTED)
+                   ? WiFi.localIP().toString() : "";
+
+  bool hostIsAp  = (host == apIp);
+  bool hostIsSta = (staIp.length() && host == staIp);
+
+  if (hostIsAp || hostIsSta) {
+    if (gServer.uri().startsWith("/api/")) {
+      sendJsonErr("not found");
+      return;
+    }
+    sendHtml();
     return;
   }
-  sendHtml();
+  handleCaptive();
 }
 
 void setup() {
@@ -1407,15 +1437,24 @@ void setup() {
   gServer.on("/api/factory", HTTP_POST, handleFactory);
   gServer.on("/api/auth", HTTP_POST, handleAuth);
 
-  gServer.on("/generate_204", HTTP_GET, handleCaptive);
-  gServer.on("/gen_204", HTTP_GET, handleCaptive);
-  gServer.on("/hotspot-detect.html", HTTP_GET, handleCaptive);
-  gServer.on("/connecttest.txt", HTTP_GET, handleCaptive);
-  gServer.on("/redirect", HTTP_GET, handleCaptive);
-  gServer.on("/canonical.html", HTTP_GET, handleCaptive);
-  gServer.on("/success.txt", HTTP_GET, handleCaptive);
-  gServer.on("/ncsi.txt", HTTP_GET, handleCaptive);
-  gServer.on("/library/test/success.html", HTTP_GET, handleCaptive);
+  static const char* const kProbePaths[] = {
+    "/generate_204",
+    "/gen_204",
+    "/hotspot-detect.html",
+    "/connecttest.txt",
+    "/redirect",
+    "/canonical.html",
+    "/success.txt",
+    "/ncsi.txt",
+    "/library/test/success.html",
+    "/manifest.json",
+    "/connectivity-check.html",
+    "/captiveportal",
+    "/portal",
+  };
+  for (size_t i = 0; i < sizeof(kProbePaths) / sizeof(kProbePaths[0]); i++) {
+    gServer.on(kProbePaths[i], HTTP_ANY, handleCaptive);
+  }
 
   gServer.onNotFound(handleNotFound);
   gServer.begin();
@@ -1448,5 +1487,3 @@ void loop() {
     digitalWrite(PIN_LED, ledState ? HIGH : LOW);
   }
 }
-
-
