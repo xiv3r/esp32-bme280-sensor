@@ -18,7 +18,6 @@
 #define PIN_BOOT_BTN   0
 #define PIN_LED        2
 #define PIN_RELAY     25
-
 #define CFG_MAGIC     0x45535034UL
 #define CFG_VERSION   3
 #define CFG_NS        "espcfg"
@@ -26,7 +25,6 @@
 #define CFG_KEY_B     "cfgB"
 #define CFG_KEY_SEQ   "seq"
 #define CFG_KEY_AUTH  "authPass"
-
 #define BME_INTERVAL_MS     2000
 #define BTN_DEBOUNCE_MS       50
 #define FACTORY_HOLD_MS     5000
@@ -36,7 +34,6 @@
 #define JSON_BUF_SZ          896
 #define REBOOT_DELAY_MS      500
 #define FACTORY_DELAY_MS     800
-
 #define RELAY_HYST_T  0.5f
 #define RELAY_HYST_H  1.0f
 #define RELAY_HYST_P  0.5f
@@ -45,7 +42,6 @@ struct __attribute__((packed)) Config {
   uint32_t magic;
   uint16_t version;
   uint16_t crc;
-
   char     apSsid[33];
   char     apPass[65];
   uint8_t  apChannel;
@@ -53,7 +49,6 @@ struct __attribute__((packed)) Config {
   uint8_t  apMaxConn;
   int8_t   apTxPower;
   uint8_t  apAuth;
-
   char     staSsid[33];
   char     staPass[65];
   uint8_t  staDhcp;
@@ -61,10 +56,8 @@ struct __attribute__((packed)) Config {
   char     staHostname[33];
   uint8_t  staUseMac;
   uint8_t  staMac[6];
-
   float    tMin, tMax, hMin, hMax, pMin, pMax;
   uint8_t  alertsEnabled;
-
   uint8_t  relayEnabled;
   uint8_t  relayInvert;
   uint8_t  relayUseT;
@@ -78,36 +71,28 @@ static bool       gCfgDirty          = false;
 static uint32_t   gCfgLastWriteMs    = 0;
 static uint8_t    gActiveSlot        = 0;
 static Preferences gPrefs;
-
 static uint32_t   gRebootAtMs        = 0;
 static uint32_t   gFactoryAtMs       = 0;
-
 static bool       gBtnArmed          = false;
 static bool       gBtnPrev           = false;
 static uint32_t   gBtnPressMs        = 0;
-
 static Adafruit_BME280 gBme;
 static bool       gBmeOk             = false;
 static uint8_t    gBmeAddr           = 0;
 static bool       gBmeWasOk          = false;
 static uint32_t   gBmeLastRead       = 0;
-
 static float      gT = NAN, gH = NAN, gP = NAN;
-
 static bool       gRelayState        = false;
-
 static bool       gStaWantConnect    = false;
 static uint32_t   gStaLastAttempt    = 0;
 static uint32_t   gStaAttemptGap     = STA_BACKOFF_STEP;
+static uint16_t   gStaFailCount      = 0;
 static wl_status_t gStaLastStatus    = WL_IDLE_STATUS;
-
 static WebServer  gServer(80);
 static DNSServer  gDns;
 static bool       gDnsStarted        = false;
-
 static char       gJsonBuf[JSON_BUF_SZ];
 static char       gAuthPass[33] = "12345678";
-
 static uint16_t crc16(const uint8_t* data, size_t len) {
   uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < len; i++) {
@@ -128,7 +113,6 @@ static void setDefaults(Config& c) {
   memset(&c, 0, sizeof(c));
   c.magic = CFG_MAGIC;
   c.version = CFG_VERSION;
-
   strncpy(c.apSsid, "ESP32-BME280", sizeof(c.apSsid) - 1);
   strncpy(c.apPass, "12345678", sizeof(c.apPass) - 1);
   c.apChannel = 6;
@@ -136,7 +120,6 @@ static void setDefaults(Config& c) {
   c.apMaxConn = 4;
   c.apTxPower = 78;
   c.apAuth    = 1;
-
   c.staSsid[0] = 0;
   c.staPass[0] = 0;
   c.staDhcp = 1;
@@ -144,19 +127,16 @@ static void setDefaults(Config& c) {
   strncpy(c.staHostname, "esp32", sizeof(c.staHostname) - 1);
   c.staUseMac = 0;
   memset(c.staMac, 0, 6);
-
   c.tMin = -40; c.tMax = 85;
   c.hMin = 0;   c.hMax = 100;
   c.pMin = 300; c.pMax = 1100;
   c.alertsEnabled = 1;
-
   c.relayEnabled = 0;
   c.relayInvert  = 0;
   c.relayUseT    = 1;
   c.relayUseH    = 1;
   c.relayUseP    = 0;
   c.relayLogic   = 0;
-
   c.crc = cfgCrc(c);
 }
 
@@ -186,6 +166,9 @@ static bool cfgValid(const Config& c) {
   if (c.tMin >= c.tMax) return false;
   if (c.hMin >= c.hMax) return false;
   if (c.pMin >= c.pMax) return false;
+  if ((c.tMax - c.tMin) <= (2.0f * RELAY_HYST_T)) return false;
+  if ((c.hMax - c.hMin) <= (2.0f * RELAY_HYST_H)) return false;
+  if ((c.pMax - c.pMin) <= (2.0f * RELAY_HYST_P)) return false;
   if (c.relayEnabled > 1) return false;
   if (c.relayInvert  > 1) return false;
   if (c.relayUseT    > 1) return false;
@@ -193,6 +176,30 @@ static bool cfgValid(const Config& c) {
   if (c.relayUseP    > 1) return false;
   if (c.relayLogic   > 1) return false;
   return true;
+}
+
+static bool configMigrate(Config& c) {
+  if (c.magic != CFG_MAGIC) return false;
+  if (c.version != CFG_VERSION) return false;
+  bool migrated = false;
+  if ((c.tMax - c.tMin) <= (2.0f * RELAY_HYST_T)) {
+    c.tMax = c.tMin + (2.0f * RELAY_HYST_T) + 0.1f;
+    if (c.tMax > 85.0f) { c.tMax = 85.0f; c.tMin = c.tMax - (2.0f * RELAY_HYST_T) - 0.1f; }
+    migrated = true;
+  }
+  if ((c.hMax - c.hMin) <= (2.0f * RELAY_HYST_H)) {
+    c.hMax = c.hMin + (2.0f * RELAY_HYST_H) + 0.1f;
+    if (c.hMax > 100.0f) { c.hMax = 100.0f; c.hMin = c.hMax - (2.0f * RELAY_HYST_H) - 0.1f; }
+    if (c.hMin < 0.0f) { c.hMin = 0.0f; c.hMax = (2.0f * RELAY_HYST_H) + 0.1f; }
+    migrated = true;
+  }
+  if ((c.pMax - c.pMin) <= (2.0f * RELAY_HYST_P)) {
+    c.pMax = c.pMin + (2.0f * RELAY_HYST_P) + 0.1f;
+    if (c.pMax > 1100.0f) { c.pMax = 1100.0f; c.pMin = c.pMax - (2.0f * RELAY_HYST_P) - 0.1f; }
+    migrated = true;
+  }
+  if (migrated) c.crc = cfgCrc(c);
+  return cfgValid(c);
 }
 
 static bool loadConfig() {
@@ -205,13 +212,10 @@ static bool loadConfig() {
   size_t la = gPrefs.getBytes(CFG_KEY_A, &a, sizeof(a));
   size_t lb = gPrefs.getBytes(CFG_KEY_B, &b, sizeof(b));
   uint32_t seq = gPrefs.getUInt(CFG_KEY_SEQ, 0);
-
-  bool va = (la == sizeof(a)) && cfgValid(a);
-  bool vb = (lb == sizeof(b)) && cfgValid(b);
-
+  bool va = (la == sizeof(a)) && configMigrate(a);
+  bool vb = (lb == sizeof(b)) && configMigrate(b);
   if (va && (!vb || (seq & 1) == 0)) { gCfg = a; gActiveSlot = 0; return true; }
   if (vb)                             { gCfg = b; gActiveSlot = 1; return true; }
-
   setDefaults(gCfg);
   gCfgDirty = true;
   return false;
@@ -221,16 +225,12 @@ static bool saveConfigForce() {
   gCfg.magic = CFG_MAGIC;
   gCfg.version = CFG_VERSION;
   gCfg.crc = cfgCrc(gCfg);
-
   const char* key = (gActiveSlot == 0) ? CFG_KEY_B : CFG_KEY_A;
   uint8_t nextSlot = (gActiveSlot == 0) ? 1 : 0;
-
   size_t written = gPrefs.putBytes(key, &gCfg, sizeof(gCfg));
   if (written != sizeof(gCfg)) return false;
-
   uint32_t seq = gPrefs.getUInt(CFG_KEY_SEQ, 0) + 1;
   gPrefs.putUInt(CFG_KEY_SEQ, seq);
-
   gActiveSlot = nextSlot;
   gCfgDirty = false;
   gCfgLastWriteMs = millis();
@@ -245,13 +245,27 @@ static void cfgTick(uint32_t now) {
 
 static void cfgMarkDirty() { gCfgDirty = true; }
 
+static void i2cBusRecover() {
+  pinMode(PIN_I2C_SCL, OUTPUT);
+  digitalWrite(PIN_I2C_SCL, HIGH);
+  delayMicroseconds(10);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(PIN_I2C_SCL, LOW);
+    delayMicroseconds(5);
+    digitalWrite(PIN_I2C_SCL, HIGH);
+    delayMicroseconds(5);
+  }
+  pinMode(PIN_I2C_SCL, INPUT_PULLUP);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(100000);
+}
+
 static void bmeInit() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(100000);
   if (gBme.begin(0x76, &Wire))      { gBmeOk = true; gBmeAddr = 0x76; }
   else if (gBme.begin(0x77, &Wire)) { gBmeOk = true; gBmeAddr = 0x77; }
   else                              { gBmeOk = false; gBmeAddr = 0; }
-
   if (gBmeOk) {
     gBme.setSampling(Adafruit_BME280::MODE_NORMAL,
                      Adafruit_BME280::SAMPLING_X2,
@@ -267,6 +281,12 @@ static void bmeTick(uint32_t now) {
   if (!gBmeOk) {
     if ((uint32_t)(now - gBmeLastRead) >= 10000) {
       gBmeLastRead = now;
+      static uint8_t sRecoverAttempts = 0;
+      sRecoverAttempts++;
+      if (sRecoverAttempts >= 3) {
+        sRecoverAttempts = 0;
+        i2cBusRecover();
+      }
       bool ok = gBme.begin(0x76, &Wire);
       if (ok) {
         gBmeAddr = 0x76;
@@ -287,14 +307,11 @@ static void bmeTick(uint32_t now) {
     }
     return;
   }
-
   if ((uint32_t)(now - gBmeLastRead) < BME_INTERVAL_MS) return;
   gBmeLastRead = now;
-
   float t = gBme.readTemperature();
   float h = gBme.readHumidity();
   float p = gBme.readPressure() / 100.0f;
-
   bool gotSomething = false;
   if (!isnan(t) && t > -100 && t < 100) { gT = t; gotSomething = true; }
   else { gT = NAN; }
@@ -302,7 +319,6 @@ static void bmeTick(uint32_t now) {
   else { gH = NAN; }
   if (!isnan(p) && p > 100 && p < 2000) { gP = p; gotSomething = true; }
   else { gP = NAN; }
-
   if (!gotSomething && gBmeWasOk) {
     gBmeOk = false;
     gBmeWasOk = false;
@@ -314,14 +330,11 @@ static void bmeTick(uint32_t now) {
 
 static bool relayShouldBeOn() {
   if (!gCfg.relayEnabled) return false;
-
   const bool useT = gCfg.relayUseT;
   const bool useH = gCfg.relayUseH;
   const bool useP = gCfg.relayUseP;
   if (!useT && !useH && !useP) return false;
-
   int vT = 0, vH = 0, vP = 0;
-
   if (useT && !isnan(gT)) {
     bool rawOut = (gT < gCfg.tMin || gT > gCfg.tMax);
     bool inBand = (gT >= gCfg.tMin + RELAY_HYST_T &&
@@ -343,24 +356,22 @@ static bool relayShouldBeOn() {
     if (rawOut)      vP =  1;
     else if (inBand) vP = -1;
   }
-
   if (gCfg.relayLogic == 0) {
     if (vT == 1 || vH == 1 || vP == 1) return true;
-
     int evaluated = 0;
     bool allInside = true;
     if (useT && !isnan(gT)) { evaluated++; if (vT != -1) allInside = false; }
     if (useH && !isnan(gH)) { evaluated++; if (vH != -1) allInside = false; }
     if (useP && !isnan(gP)) { evaluated++; if (vP != -1) allInside = false; }
-    if (evaluated > 0 && allInside) return false;
-
+    if (evaluated == 0) return false;
+    if (allInside) return false;
     return gRelayState;
   }
 
   bool haveAny = false, allOut = true;
-  if (useT) { if (isnan(gT)) return gRelayState; haveAny = true; if (vT != 1) allOut = false; }
-  if (useH) { if (isnan(gH)) return gRelayState; haveAny = true; if (vH != 1) allOut = false; }
-  if (useP) { if (isnan(gP)) return gRelayState; haveAny = true; if (vP != 1) allOut = false; }
+  if (useT) { if (isnan(gT)) return false; haveAny = true; if (vT != 1) allOut = false; }
+  if (useH) { if (isnan(gH)) return false; haveAny = true; if (vH != 1) allOut = false; }
+  if (useP) { if (isnan(gP)) return false; haveAny = true; if (vP != 1) allOut = false; }
   if (!haveAny) return false;
   return allOut;
 }
@@ -382,7 +393,6 @@ static void applyApConfig() {
   wifi_config_t wc;
   memset(&wc, 0, sizeof(wc));
   esp_wifi_get_config(WIFI_IF_AP, &wc);
-
   strncpy((char*)wc.ap.ssid, gCfg.apSsid, sizeof(wc.ap.ssid));
   wc.ap.ssid_len = strlen(gCfg.apSsid);
   if (gCfg.apAuth && strlen(gCfg.apPass) >= 8) {
@@ -398,7 +408,6 @@ static void applyApConfig() {
   wc.ap.ssid_hidden = gCfg.apHidden ? 1 : 0;
   wc.ap.max_connection = gCfg.apMaxConn;
   wc.ap.beacon_interval = 100;
-
   esp_wifi_set_config(WIFI_IF_AP, &wc);
   esp_wifi_set_max_tx_power(gCfg.apTxPower);
 }
@@ -431,19 +440,20 @@ static void staBegin() {
   gStaWantConnect = true;
   gStaLastAttempt = millis();
   gStaAttemptGap = STA_BACKOFF_STEP;
+  gStaFailCount  = 0;
+  gStaLastStatus = WL_IDLE_STATUS;
 }
 
 static void staTick(uint32_t now) {
   if (!gStaWantConnect) return;
   wl_status_t s = WiFi.status();
-
   if (s != gStaLastStatus) {
     gStaLastStatus = s;
     if (s == WL_CONNECTED) {
       gStaAttemptGap = STA_BACKOFF_STEP;
+      gStaFailCount  = 0;
     }
   }
-
   if (s != WL_CONNECTED &&
       (uint32_t)(now - gStaLastAttempt) >= gStaAttemptGap) {
     gStaLastAttempt = now;
@@ -451,7 +461,14 @@ static void staTick(uint32_t now) {
       gStaAttemptGap += STA_BACKOFF_STEP;
       if (gStaAttemptGap > STA_BACKOFF_MAX) gStaAttemptGap = STA_BACKOFF_MAX;
     }
-    WiFi.reconnect();
+    gStaFailCount++;
+    if (gStaFailCount >= 12) {
+      gStaFailCount = 0;
+      WiFi.disconnect(true, false);
+      WiFi.begin(gCfg.staSsid, gCfg.staPass);
+    } else {
+      WiFi.reconnect();
+    }
   }
 }
 
@@ -792,7 +809,7 @@ function loadThr(){
     $('relayUseH').value=d.relayUseH;
     $('relayUseP').value=d.relayUseP;
     $('relayInv').value=d.relayInv;
-  });
+  }).catch(function(){$('thrMsg').innerHTML='<span class="er">Failed to load</span>';});
 }
 function parseField(id,name,min,max){
   var el=$(id);
@@ -851,7 +868,7 @@ function loadAp(){
     $('apAuth').value=d.auth;$('apCh').value=d.ch;
     $('apHidden').value=d.hidden;$('apMax').value=d.max;
     $('apTx').value=d.tx;
-  });
+  }).catch(function(){$('apMsg').innerHTML='<span class="er">Failed to load</span>';});
 }
 $('apSave').onclick=function(){
   if(inflight>0){$('apMsg').innerHTML='<span class="wn">Please wait...</span>';return;}
@@ -878,7 +895,7 @@ function loadSta(){
     $('staHost').value=d.host;
     $('staUseMac').value=d.useMac;
     $('staMac').value=d.mac;
-  });
+  }).catch(function(){$('staMsg').innerHTML='<span class="er">Failed to load</span>';});
 }
 $('staSave').onclick=function(){
   if(inflight>0){$('staMsg').innerHTML='<span class="wn">Please wait...</span>';return;}
@@ -914,7 +931,7 @@ function loadSys(){
     $('sHeap').textContent=d.heap+' bytes';
     $('sHeapMin').textContent=d.heapMin+' bytes';
     $('sRst').textContent=d.rst;
-  });
+  }).catch(function(){});
 }
 $('btnAuth').onclick=function(){
   var p=$('newAuth').value;
@@ -970,15 +987,14 @@ static void sendJsonErr(const char* e) {
 
 static void handleStatus() {
   if (!checkAuth()) return;
+  wl_status_t staNow = WiFi.status();
   bool tAlert = !isnan(gT) && (gT < gCfg.tMin || gT > gCfg.tMax);
   bool hAlert = !isnan(gH) && (gH < gCfg.hMin || gH > gCfg.hMax);
   bool pAlert = !isnan(gP) && (gP < gCfg.pMin || gP > gCfg.pMax);
-
   char tB[12], hB[12], pB[12];
   if (isnan(gT)) strcpy(tB, "null"); else snprintf(tB, sizeof(tB), "%.2f", gT);
   if (isnan(gH)) strcpy(hB, "null"); else snprintf(hB, sizeof(hB), "%.2f", gH);
   if (isnan(gP)) strcpy(pB, "null"); else snprintf(pB, sizeof(pB), "%.2f", gP);
-
   snprintf(gJsonBuf, sizeof(gJsonBuf),
     "{\"t\":%s,\"h\":%s,\"p\":%s,\"tAlert\":%s,\"hAlert\":%s,\"pAlert\":%s,"
     "\"alertsEn\":%u,\"sensorOk\":%s,\"sensorAddr\":%u,"
@@ -995,9 +1011,9 @@ static void handleStatus() {
     gCfg.apSsid,
     WiFi.softAPIP().toString().c_str(),
     WiFi.softAPgetStationNum(),
-    WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
-    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-",
-    WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
+    staNow == WL_CONNECTED ? "connected" : "disconnected",
+    staNow == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-",
+    staNow == WL_CONNECTED ? WiFi.RSSI() : 0,
     gCfg.staHostname,
     gRelayState ? "true" : "false",
     (unsigned)gCfg.relayEnabled
@@ -1086,14 +1102,22 @@ static void handlePostThr() {
   if (tMin < -40 || tMax > 85) { sendJsonErr("t range"); return; }
   if (hMin < 0 || hMax > 100) { sendJsonErr("h range"); return; }
   if (pMin < 300 || pMax > 1100) { sendJsonErr("p range"); return; }
+  if ((tMax - tMin) <= (2.0f * RELAY_HYST_T)) { sendJsonErr("t band too narrow"); return; }
+  if ((hMax - hMin) <= (2.0f * RELAY_HYST_H)) { sendJsonErr("h band too narrow"); return; }
+  if ((pMax - pMin) <= (2.0f * RELAY_HYST_P)) { sendJsonErr("p band too narrow"); return; }
   if (en > 1) { sendJsonErr("en"); return; }
-
+  bool changed = (gCfg.alertsEnabled != (uint8_t)en) ||
+                 (gCfg.tMin != tMin) || (gCfg.tMax != tMax) ||
+                 (gCfg.hMin != hMin) || (gCfg.hMax != hMax) ||
+                 (gCfg.pMin != pMin) || (gCfg.pMax != pMax);
   gCfg.alertsEnabled = (uint8_t)en;
   gCfg.tMin = tMin; gCfg.tMax = tMax;
   gCfg.hMin = hMin; gCfg.hMax = hMax;
   gCfg.pMin = pMin; gCfg.pMax = pMax;
-  cfgMarkDirty();
-  saveConfigForce();
+  if (changed) {
+    cfgMarkDirty();
+    saveConfigForce();
+  }
   relayTick();
   sendJsonOk();
 }
@@ -1114,14 +1138,22 @@ static void handlePostRelay() {
     sendJsonErr("relay: no metric selected"); return;
   }
 
+  bool changed = (gCfg.relayEnabled != (uint8_t)en) ||
+                 (gCfg.relayInvert  != (uint8_t)inv) ||
+                 (gCfg.relayUseT    != (uint8_t)useT) ||
+                 (gCfg.relayUseH    != (uint8_t)useH) ||
+                 (gCfg.relayUseP    != (uint8_t)useP) ||
+                 (gCfg.relayLogic   != (uint8_t)logic);
   gCfg.relayEnabled = (uint8_t)en;
   gCfg.relayInvert  = (uint8_t)inv;
   gCfg.relayUseT    = (uint8_t)useT;
   gCfg.relayUseH    = (uint8_t)useH;
   gCfg.relayUseP    = (uint8_t)useP;
   gCfg.relayLogic   = (uint8_t)logic;
-  cfgMarkDirty();
-  saveConfigForce();
+  if (changed) {
+    cfgMarkDirty();
+    saveConfigForce();
+  }
   relayTick();
   sendJsonOk();
 }
@@ -1158,7 +1190,13 @@ static void handlePostAp() {
   if (hidden > 1) { sendJsonErr("bad hidden"); return; }
   if (maxc < 1 || maxc > 8) { sendJsonErr("bad max"); return; }
   if (tx > 84) { sendJsonErr("bad tx"); return; }
-
+  bool changed = (strcmp(gCfg.apSsid, ssid.c_str()) != 0) ||
+                 (gCfg.apAuth != (uint8_t)auth) ||
+                 (gCfg.apChannel != (uint8_t)ch) ||
+                 (gCfg.apHidden != (uint8_t)hidden) ||
+                 (gCfg.apMaxConn != (uint8_t)maxc) ||
+                 (gCfg.apTxPower != (int8_t)tx) ||
+                 (pass.length() > 0 && strcmp(gCfg.apPass, pass.c_str()) != 0);
   strncpy(gCfg.apSsid, ssid.c_str(), sizeof(gCfg.apSsid) - 1);
   gCfg.apSsid[32] = 0;
   if (pass.length() > 0) {
@@ -1170,8 +1208,10 @@ static void handlePostAp() {
   gCfg.apHidden = (uint8_t)hidden;
   gCfg.apMaxConn = (uint8_t)maxc;
   gCfg.apTxPower = (int8_t)tx;
-  cfgMarkDirty();
-  saveConfigForce();
+  if (changed) {
+    cfgMarkDirty();
+    saveConfigForce();
+  }
   applyApConfig();
   sendJsonOk();
 }
@@ -1208,7 +1248,6 @@ static void handlePostSta() {
   jsonGetStr(body, "dns1", dns1);
   jsonGetStr(body, "dns2", dns2);
   jsonGetStr(body, "mac", mac);
-
   if (ssid.length() > 32) { sendJsonErr("bad ssid"); return; }
   for (size_t i = 0; i < ssid.length(); i++) {
     uint8_t c = (uint8_t)ssid[i];
@@ -1222,7 +1261,6 @@ static void handlePostSta() {
   }
   if (dhcp > 1) { sendJsonErr("bad dhcp"); return; }
   if (useMac > 1) { sendJsonErr("bad useMac"); return; }
-
   if (dhcp == 0) {
     if (strToIp(ip) == 0 || strToIp(gw) == 0 || strToIp(mask) == 0) {
       sendJsonErr("bad static ip"); return;
@@ -1250,7 +1288,9 @@ static void handlePostSta() {
   bool credChanged =
     (strcmp(gCfg.staSsid, ssid.c_str()) != 0) ||
     (pass.length() > 0 && strcmp(gCfg.staPass, pass.c_str()) != 0);
-
+  bool hostChanged = (strcmp(gCfg.staHostname, host.c_str()) != 0);
+  bool changed = credChanged || ipChanged || macChanged || hostChanged ||
+                 (gCfg.staUseMac != (uint8_t)useMac);
   strncpy(gCfg.staSsid, ssid.c_str(), sizeof(gCfg.staSsid) - 1);
   gCfg.staSsid[32] = 0;
   if (pass.length() > 0) {
@@ -1267,11 +1307,11 @@ static void handlePostSta() {
   gCfg.staHostname[32] = 0;
   gCfg.staUseMac = (uint8_t)useMac;
   if (useMac) memcpy(gCfg.staMac, newMac, 6);
-  cfgMarkDirty();
-  saveConfigForce();
-
-  bool rebootRequired = macChanged || ipChanged || credChanged;
-
+  if (changed) {
+    cfgMarkDirty();
+    saveConfigForce();
+  }
+  bool rebootRequired = macChanged || ipChanged || credChanged || hostChanged;
   snprintf(gJsonBuf, sizeof(gJsonBuf),
     "{\"ok\":true,\"rebootRequired\":%s}",
     rebootRequired ? "true" : "false");
@@ -1304,7 +1344,10 @@ static void handleSys() {
 
 static void handleReboot() {
   if (!checkAuth()) return;
-  if (gCfgDirty) saveConfigForce();
+  if (gCfgDirty && !saveConfigForce()) {
+    sendJsonErr("save failed - not rebooting");
+    return;
+  }
   sendJsonOk();
   gRebootAtMs = millis() + REBOOT_DELAY_MS;
   if (gRebootAtMs == 0) gRebootAtMs = 1;
@@ -1324,26 +1367,23 @@ static void handleAuth() {
   if (!jsonGetStr(body, "pass", pass) || pass.length() < 8 || pass.length() > 32) {
     sendJsonErr("bad pass"); return;
   }
-
   char oldPass[33];
   strncpy(oldPass, gAuthPass, sizeof(oldPass) - 1);
   oldPass[sizeof(oldPass) - 1] = 0;
-
   char newPass[33];
   strncpy(newPass, pass.c_str(), sizeof(newPass) - 1);
   newPass[sizeof(newPass) - 1] = 0;
-
-  gPrefs.begin(CFG_NS, false);
+  if (!gPrefs.begin(CFG_NS, false)) {
+    sendJsonErr("nvs open failed");
+    return;
+  }
   size_t written = gPrefs.putString(CFG_KEY_AUTH, newPass);
-  gPrefs.end();
-
   if (written != strlen(newPass)) {
     strncpy(gAuthPass, oldPass, sizeof(gAuthPass) - 1);
     gAuthPass[sizeof(gAuthPass) - 1] = 0;
     sendJsonErr("nvs write failed");
     return;
   }
-
   strncpy(gAuthPass, newPass, sizeof(gAuthPass) - 1);
   gAuthPass[sizeof(gAuthPass) - 1] = 0;
   sendJsonOk();
@@ -1359,15 +1399,12 @@ static void handleCaptive() {
 static void handleNotFound() {
   IPAddress apAddr = WiFi.softAPIP();
   if (apAddr == IPAddress(0, 0, 0, 0)) apAddr = IPAddress(192, 168, 4, 1);
-
   String host  = gServer.hostHeader();
   String apIp  = apAddr.toString();
   String staIp = (WiFi.status() == WL_CONNECTED)
                    ? WiFi.localIP().toString() : "";
-
   bool hostIsAp  = (host == apIp);
   bool hostIsSta = (staIp.length() && host == staIp);
-
   if (hostIsAp || hostIsSta) {
     if (gServer.uri().startsWith("/api/")) {
       sendJsonErr("not found");
@@ -1383,18 +1420,14 @@ void setup() {
   pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
-
   loadConfig();
   gCfgLastWriteMs = millis();
-
   pinMode(PIN_RELAY, OUTPUT);
   gRelayState = false;
   relayApplyPin();
-
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
-
   WiFi.softAPsetHostname("esp32-ap");
   if (gCfg.apAuth && strlen(gCfg.apPass) >= 8) {
     WiFi.softAP(gCfg.apSsid, gCfg.apPass, gCfg.apChannel,
@@ -1404,16 +1437,12 @@ void setup() {
                 gCfg.apHidden, gCfg.apMaxConn);
   }
   applyApConfig();
-
   staBegin();
-
   gDns.setErrorReplyCode(DNSReplyCode::NoError);
   gDns.start(53, "*", WiFi.softAPIP());
   gDnsStarted = true;
-
   bmeInit();
   gBmeLastRead = millis();
-
   gPrefs.begin(CFG_NS, false);
   String ap = gPrefs.getString(CFG_KEY_AUTH, "");
   if (ap.length() >= 8) {
@@ -1422,7 +1451,6 @@ void setup() {
   } else {
     gPrefs.putString(CFG_KEY_AUTH, gAuthPass);
   }
-
   gServer.on("/", HTTP_GET, sendHtml);
   gServer.on("/api/status", HTTP_GET, handleStatus);
   gServer.on("/api/thresholds", HTTP_GET, handleGetThr);
@@ -1436,7 +1464,6 @@ void setup() {
   gServer.on("/api/reboot", HTTP_POST, handleReboot);
   gServer.on("/api/factory", HTTP_POST, handleFactory);
   gServer.on("/api/auth", HTTP_POST, handleAuth);
-
   static const char* const kProbePaths[] = {
     "/generate_204",
     "/gen_204",
@@ -1455,23 +1482,19 @@ void setup() {
   for (size_t i = 0; i < sizeof(kProbePaths) / sizeof(kProbePaths[0]); i++) {
     gServer.on(kProbePaths[i], HTTP_ANY, handleCaptive);
   }
-
   gServer.onNotFound(handleNotFound);
   gServer.begin();
 }
 
 void loop() {
   uint32_t now = millis();
-
   buttonTick(now);
   cfgTick(now);
   bmeTick(now);
   staTick(now);
   relayTick();
-
   gServer.handleClient();
   if (gDnsStarted) gDns.processNextRequest();
-
   if (gRebootAtMs && (int32_t)(now - gRebootAtMs) >= 0) {
     ESP.restart();
   }
