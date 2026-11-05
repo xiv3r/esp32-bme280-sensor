@@ -1,108 +1,130 @@
 <img src="https://github.com/xiv3r/esp32-bme280-sensor/blob/main/esp32-bme280.png">
 
-## 1. What you need
+## 1. Required Hardware
 
-**Hardware**
-- ESP32 dev board
-- BME280 sensor (I2C)
-- 1-channel relay module (with driver — most modules have one)
-- Jumper wires
-- 10 kΩ resistor (important, see step 6)
-
-**Software**
-- Arduino IDE (or PlatformIO)
-- ESP32 board package installed
-- Libraries: `Adafruit BME280 Library`, `Adafruit Unified Sensor`
-
----
+| Part | Notes |
+|---|---|
+| ESP32 dev board | Any 30/38-pin module |
+| BME280 module | I2C, address `0x76` or `0x77` (auto-detected) |
+| Relay module | Optional, 3.3V-compatible signal |
 
 ## 2. Wiring
 
-### BME280 → ESP32
+| Signal | ESP32 Pin | Connect to |
+|---|---|---|
+| I2C SDA | GPIO 21 | BME280 SDA |
+| I2C SCL | GPIO 22 | BME280 SCL |
+| Relay IN | GPIO 25 | Relay module IN |
+| Status LED | GPIO 2 | Built-in LED (onboard) |
+| Factory reset | GPIO 0 | BOOT button (built-in) |
+| 3.3V / GND | 3V3 / GND | BME280 VCC/GND, Relay VCC/GND |
 
-| BME280 | ESP32 |
-|---|---|
-| VIN / VCC | 3V3 |
-| GND | GND |
-| SDA | GPIO 21 |
-| SCL | GPIO 22 |
+> ⚠️ **Power the relay module from a separate 5V supply if it has a coil** — ESP32 3.3V cannot drive relay coils directly. Use a relay module with built-in opto-isolation and transistor driver.
 
-### Relay module → ESP32
+## 3. Flash the Firmware
 
-| Relay module | ESP32 |
-|---|---|
-| VCC | 5V (or 3V3 — check your module) |
-| GND | GND |
-| IN | **GPIO 25** |
+**Arduino IDE:**
+1. Install **ESP32 board package** (Boards Manager → "esp32 by Espressif").
+2. Install libraries via Library Manager:
+   - `Adafruit BME280 Library`
+   - `Adafruit Unified Sensor`
+3. Board: **ESP32 Dev Module**. Upload speed: **921600**.
+4. Select correct COM port → **Upload**.
+5. Or download the firmware above and flash
 
-**Important:** add a **10 kΩ resistor from GPIO 25 to GND**. This keeps the relay OFF during boot/reset. Without it, the relay may click on for a moment when the ESP32 powers up.
+## 4. First Boot — Connect
 
----
-
-## 3. Flash the firmware
-
-1. Open `v3-esp32-gpio25.txt` in Arduino IDE (save it as `.ino` first if needed).
-2. Select your board: **Tools → Board → ESP32 Dev Module**.
-3. Select the correct COM port.
-4. Click **Upload**.
-
-> ⚠️ **First boot after upgrade from v2:** WiFi settings are reset to defaults. You will need to reconfigure WiFi. This is normal.
-
----
-
-## 4. First-time setup
-
-1. Power the ESP32.
-2. On your phone or laptop, connect to WiFi **`ESP32-BME280`** (password **`12345678`**).
-3. A captive-portal page should open. If not, open a browser and go to **`http://192.168.4.1`**.
-4. Log in with:
-   - **Username:** `admin`
+1. Power on. Wait ~5 seconds.
+2. On your phone/laptop, connect to WiFi:
+   - **SSID:** `ESP32-BME280`
    - **Password:** `12345678`
-5. Go to the **WiFi STA** tab → enter your home WiFi name and password → **Apply STA** → **Reboot**.
+3. A captive portal should pop up automatically. If not, open browser → **http://192.168.4.1**
+4. Login: **Username `admin`**, **Password `12345678`**
 
-Now the ESP32 is on your home network. You can reach it at its new IP address, or reconnect to `ESP32-BME280` if you prefer.
+## 5. Configure (in order)
 
----
+### A. Change admin password — **do this first**
+System tab → **Change Admin Password** → enter 8–32 chars → **Change Password** → reload page → log in with new password.
 
-## 5. Configure the thresholds
+### B. Configure WiFi STA (optional — for home network access)
+WiFi STA tab:
+- **SSID / Password** — your home WiFi
+- **Mode:** DHCP (recommended) or Static
+- If Static: fill IP, Gateway, Subnet mask (e.g. `255.255.255.0`), DNS1
+- **Hostname** — e.g. `bme280` (reachable as `bme280.local`)
+- Click **Apply STA** → banner appears → click **Reboot Now**
 
-1. Open the **Thresholds** tab.
-2. Set min/max for **Temperature**, **Humidity**, **Pressure**.
-3. Click **Save Thresholds**.
-4. The dashboard cards turn **yellow** when a value is out of range.
+### C. Set thresholds & relay
+Thresholds tab:
+- **Alerts:** Enabled
+- **Temp min/max, Humidity min/max, Pressure min/max** — your safe ranges
+- **Save Thresholds**
 
----
+Relay section (below thresholds):
+- **Relay enabled:** Yes
+- **Logic:** OR (turn on if any alert) or AND (only if all alerts)
+- **React to temperature/humidity/pressure:** pick metrics
+- **Active-low relay:** Yes if your relay module is active-low (most are)
+- **Save Relay Settings**
 
-## 6. Configure the relay
+### D. WiFi AP settings (optional)
+WiFi AP tab — change SSID, password, channel, TX power. Click **Apply AP** (takes effect immediately, no reboot).
 
-Still on the **Thresholds** tab, scroll to **Relay (GPIO 25)**:
+## 6. Daily Use
 
-| Option | What it does |
+- Open **http://192.168.4.1** (AP mode) or **http://<sta-ip>** / **http://bme280.local** (STA mode).
+- **Dashboard** auto-refreshes every 2s: temperature, humidity, pressure, sensor status, relay status.
+- Out-of-range values highlight **yellow**; sensor failure shows **red**.
+- Relay state shown as **ON/OFF (GPIO 25)**.
+
+## 7. Maintenance
+
+| Task | How |
 |---|---|
-| **Relay enabled** | Turn the relay feature on/off |
-| **Logic** | **OR** = relay ON if *any* checked metric is out of range. **AND** = relay ON only if *all* checked metrics are out of range |
-| **React to temperature / humidity / pressure** | Pick which metrics drive the relay |
-| **Active-low relay** | Set to **Yes** if your relay module turns ON when the pin is LOW (most cheap modules do). Set to **No** if it turns ON when the pin is HIGH |
+| **Reboot** | System tab → Reboot |
+| **Factory reset** | Hold **BOOT button 5s**, or System tab → Factory Reset (type `RESET`) |
+| **Change admin password** | System tab |
+| **Change thresholds / relay** | Thresholds tab |
+| **Check uptime / heap** | System tab (uptime resets at ~49.7 days — cosmetic) |
 
-Click **Save Relay Settings**.
+## 8. Status Indicators
 
-> **Tip:** If you don't know whether your relay is active-low or active-high, enable it with temperature selected and set a threshold you can easily cross (e.g. temp max = 25 °C). Touch the BME280 with your finger — if the relay clicks ON when the dashboard shows an alert, your invert setting is correct.
+**Dashboard sensor status:**
+- 🟢 **Sensor OK at 0x76** — all good
+- 🟡 **Sensor partial** — one metric unavailable; relay skips that metric
+- 🔴 **Sensor not detected** — auto-retries every 10s, I2C bus recovery every 3rd attempt
 
----
+**LED (GPIO 2):** blinks 1 Hz = running normally.
 
-## 7. How the relay behaves
+## 9. Troubleshooting
 
-- Turns **ON** the moment a selected sensor value crosses a threshold (matches the dashboard alert exactly).
-- Turns **OFF** only when the value comes back **inside** the range by a small safety margin (0.5 °C / 1 %RH / 0.5 hPa). This prevents clicking on/off when the value hovers right at the threshold.
-- If the sensor is unplugged, the relay **holds its last state** (it does not toggle randomly).
-- The relay is **independent of the "Alerts" enabled switch**. You can have the relay working with dashboard warnings turned off.
+| Symptom | Fix |
+|---|---|
+| Can't connect to `ESP32-BME280` | Wait 10s after power-on; check 3.3V supply |
+| Captive portal doesn't pop up | Manually open `http://192.168.4.1` |
+| Sensor not detected | Check SDA=21, SCL=22, 3.3V, GND; try address `0x77` (auto-detected) |
+| Relay always ON/OFF | Toggle **Active-low relay** setting |
+| STA won't connect | Verify SSID/password; check 2.4GHz (ESP32 does not support 5GHz) |
+| Forgot admin password | Factory reset (hold BOOT 5s), password returns to `12345678` |
+| Wrong static IP after save | Reboot; if unreachable, factory reset and reconfigure |
 
----
+## 10. Safety Notes
 
-## 8. Common tasks
+- Relay **fails OFF** on sensor loss (both OR and AND logic) — safe for most uses.
+- **Do not** switch mains voltage directly through the relay module unless it is rated for it and properly enclosed.
+- Use a **separate 5V supply** for relay coils, common ground with ESP32.
+- The device runs unattended for years — ensure adequate ventilation and a stable 5V supply.
 
-### Change the admin password
-**System** tab → **Change Admin Password** → enter new password (min 8 characters) → **Change Password** → reload the page and log in with the new password.
+## 11. Default Credentials (after factory reset)
+
+| Setting | Value |
+|---|---|
+| AP SSID | `ESP32-BME280` |
+| AP Password | `12345678` |
+| Web login | `admin` / `12345678` |
+| AP IP | `192.168.4.1` |
+
+**Change the admin password on first use** — the default is publicly known.
 
 ### Reboot the ESP32
 **System** tab → **Reboot** button.
