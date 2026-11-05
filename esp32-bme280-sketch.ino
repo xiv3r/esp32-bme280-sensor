@@ -30,6 +30,7 @@
 #define CFG_WRITE_MIN_MS   60000UL
 #define STA_BACKOFF_MAX    30000UL
 #define STA_BACKOFF_STEP    5000UL
+#define STA_HARD_FAIL_REBOOT  60
 #define JSON_BUF_SZ          896
 #define REBOOT_DELAY_MS      500
 #define FACTORY_DELAY_MS     800
@@ -75,6 +76,8 @@ static uint32_t   gFactoryAtMs       = 0;
 static bool       gBtnArmed          = false;
 static bool       gBtnPrev           = false;
 static uint32_t   gBtnPressMs        = 0;
+static bool       gBtnBootSeen       = false;
+static bool       gBtnEdgePress      = false;
 static Adafruit_BME280 gBme;
 static bool       gBmeOk             = false;
 static uint8_t    gBmeAddr           = 0;
@@ -145,8 +148,9 @@ static bool cfgValid(const Config& c) {
   if (c.crc != cfgCrc(c)) return false;
   if (c.apChannel < 1 || c.apChannel > 13) return false;
   if (c.apMaxConn < 1 || c.apMaxConn > 8) return false;
-  if (c.apTxPower < 0 || c.apTxPower > 84) return false;
+  if (c.apTxPower < 8 || c.apTxPower > 84) return false;
   if (c.apAuth > 1) return false;
+  if (c.apHidden > 1) return false;
   if (c.apSsid[0] == 0) return false;
   for (size_t i = 0; i < sizeof(c.apSsid) && c.apSsid[i]; i++) {
     uint8_t ch = (uint8_t)c.apSsid[i];
@@ -162,6 +166,13 @@ static bool cfgValid(const Config& c) {
   }
   if (c.apAuth == 1 && (strlen(c.apPass) < 8 || strlen(c.apPass) > 63)) return false;
   if (c.staSsid[0] != 0 && strlen(c.staPass) > 63) return false;
+  if (c.staSsid[0] != 0 && strlen(c.staPass) > 0 && strlen(c.staPass) < 8) return false;
+  if (!isfinite(c.tMin) || !isfinite(c.tMax) ||
+      !isfinite(c.hMin) || !isfinite(c.hMax) ||
+      !isfinite(c.pMin) || !isfinite(c.pMax)) return false;
+  if (c.tMin < -40.0f || c.tMax > 85.0f) return false;
+  if (c.hMin < 0.0f || c.hMax > 100.0f) return false;
+  if (c.pMin < 300.0f || c.pMax > 1100.0f) return false;
   if (c.tMin >= c.tMax) return false;
   if (c.hMin >= c.hMax) return false;
   if (c.pMin >= c.pMax) return false;
@@ -169,6 +180,8 @@ static bool cfgValid(const Config& c) {
   if ((c.hMax - c.hMin) <= (2.0f * RELAY_HYST_H)) return false;
   if ((c.pMax - c.pMin) <= (2.0f * RELAY_HYST_P)) return false;
   if (c.relayEnabled > 1) return false;
+  if (c.staDhcp > 1) return false;
+  if (c.staUseMac > 1) return false;
   if (c.staUseMac) {
     if (c.staMac[0] & 0x01) return false;
     bool all0 = true, allF = true;
@@ -238,7 +251,8 @@ static bool saveConfigForce() {
   size_t written = gPrefs.putBytes(key, &gCfg, sizeof(gCfg));
   if (written != sizeof(gCfg)) return false;
   uint32_t seq = gPrefs.getUInt(CFG_KEY_SEQ, 0) + 1;
-  gPrefs.putUInt(CFG_KEY_SEQ, seq);
+  size_t seqWritten = gPrefs.putUInt(CFG_KEY_SEQ, seq);
+  if (seqWritten != sizeof(uint32_t)) return false;
   gActiveSlot = nextSlot;
   gCfgDirty = false;
   gCfgLastWriteMs = millis();
@@ -254,16 +268,24 @@ static void cfgTick(uint32_t now) {
 static void cfgMarkDirty() { gCfgDirty = true; }
 
 static void i2cBusRecover() {
-  pinMode(PIN_I2C_SCL, OUTPUT);
-  digitalWrite(PIN_I2C_SCL, HIGH);
+  Wire.end();
+  pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+  pinMode(PIN_I2C_SCL, INPUT_PULLUP);
   delayMicroseconds(10);
   for (int i = 0; i < 9; i++) {
+    pinMode(PIN_I2C_SCL, OUTPUT);
     digitalWrite(PIN_I2C_SCL, LOW);
     delayMicroseconds(5);
-    digitalWrite(PIN_I2C_SCL, HIGH);
+    pinMode(PIN_I2C_SCL, INPUT_PULLUP);
     delayMicroseconds(5);
   }
+  pinMode(PIN_I2C_SDA, OUTPUT);
+  digitalWrite(PIN_I2C_SDA, LOW);
+  delayMicroseconds(5);
   pinMode(PIN_I2C_SCL, INPUT_PULLUP);
+  delayMicroseconds(5);
+  pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+  delayMicroseconds(5);
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(100000);
 }
@@ -377,12 +399,24 @@ static bool relayShouldBeOn() {
     return gRelayState;
   }
 
-  bool haveAny = false, allOut = true;
-  if (useT) { if (isnan(gT)) return false; haveAny = true; if (vT != 1) allOut = false; }
-  if (useH) { if (isnan(gH)) return false; haveAny = true; if (vH != 1) allOut = false; }
-  if (useP) { if (isnan(gP)) return false; haveAny = true; if (vP != 1) allOut = false; }
+  bool haveAny = false;
+  bool anyInBand = false;
+  bool allOut = true;
+  bool anyDeadband = false;
+  if (useT) { if (isnan(gT)) return false; haveAny = true;
+    if (vT == 1) { /* out */ } else if (vT == -1) { anyInBand = true; allOut = false; }
+    else { anyDeadband = true; allOut = false; } }
+  if (useH) { if (isnan(gH)) return false; haveAny = true;
+    if (vH == 1) { /* out */ } else if (vH == -1) { anyInBand = true; allOut = false; }
+    else { anyDeadband = true; allOut = false; } }
+  if (useP) { if (isnan(gP)) return false; haveAny = true;
+    if (vP == 1) { /* out */ } else if (vP == -1) { anyInBand = true; allOut = false; }
+    else { anyDeadband = true; allOut = false; } }
   if (!haveAny) return false;
-  return allOut;
+  if (allOut) return true;
+  if (anyInBand) return false;
+  if (anyDeadband) return gRelayState;
+  return false;
 }
 
 static void relayApplyPin() {
@@ -470,11 +504,14 @@ static void staTick(uint32_t now) {
   }
   if (s == WL_CONNECTED) return;
   uint32_t gap = gStaAttemptGap;
-  if (gStaHardFailCount >= 48) gap = 300000UL; 
+  if (gStaHardFailCount >= 48) gap = 300000UL;
   if ((uint32_t)(now - gStaLastAttempt) < gap) return;
   gStaLastAttempt = now;
   if (gStaHardFailCount >= 48) {
     gStaHardFailCount++;
+    if (gStaHardFailCount > STA_HARD_FAIL_REBOOT) {
+      ESP.restart();
+    }
     WiFi.reconnect();
     return;
   }
@@ -502,15 +539,23 @@ static void factoryReset() {
 
 static void buttonTick(uint32_t now) {
   bool pressed = (digitalRead(PIN_BOOT_BTN) == LOW);
-  if (pressed && !gBtnPrev) {
-    gBtnPressMs = now;
-    gBtnArmed = false;
+  if (!gBtnBootSeen) {
+    gBtnBootSeen  = true;
+    gBtnPrev      = pressed;
+    gBtnEdgePress = false;
+    if (pressed) return;
   }
+  if (pressed && !gBtnPrev) {
+    gBtnPressMs   = now;
+    gBtnArmed     = false;
+    gBtnEdgePress = true;
+  }
+  if (!pressed) gBtnEdgePress = false;
   uint32_t held = now - gBtnPressMs;
-  if (pressed && !gBtnArmed && held >= BTN_DEBOUNCE_MS) {
+  if (gBtnEdgePress && pressed && !gBtnArmed && held >= BTN_DEBOUNCE_MS) {
     gBtnArmed = true;
   }
-  if (pressed && gBtnArmed && held >= FACTORY_HOLD_MS) {
+  if (gBtnEdgePress && pressed && gBtnArmed && held >= FACTORY_HOLD_MS) {
     factoryReset();
   }
   gBtnPrev = pressed;
@@ -1055,11 +1100,31 @@ static bool jsonGetFloat(const String& body, const char* key, float& out) {
   while (i < (int)body.length() && (body[i] == ' ' || body[i] == '\t')) i++;
   int j = i;
   int dots = 0;
-  while (j < (int)body.length() && (body[j] == '-' || body[j] == '+' || body[j] == '.' || (body[j] >= '0' && body[j] <= '9'))) {
-    if (body[j] == '.') dots++;
-    j++;
+  int digits = 0;
+  bool seenSign = false;
+  while (j < (int)body.length()) {
+    char c = body[j];
+    if (c == '-' || c == '+') {
+      if (seenSign || digits > 0 || dots > 0) return false;
+      seenSign = true;
+      j++;
+      continue;
+    }
+    if (c == '.') {
+      if (dots > 0) return false;
+      dots++;
+      j++;
+      continue;
+    }
+    if (c >= '0' && c <= '9') { digits++; j++; continue; }
+    break;
   }
-  if (j == i || dots > 1) return false;
+  if (j == i || digits == 0) return false;
+  if (j < (int)body.length()) {
+    char term = body[j];
+    if (term != '}' && term != ',' && term != ' ' && term != '\t' &&
+        term != '\r' && term != '\n') return false;
+  }
   out = body.substring(i, j).toFloat();
   return true;
 }
@@ -1071,9 +1136,21 @@ static bool jsonGetUInt(const String& body, const char* key, uint32_t& out) {
   i += k.length();
   while (i < (int)body.length() && (body[i] == ' ' || body[i] == '\t')) i++;
   int j = i;
-  while (j < (int)body.length() && body[j] >= '0' && body[j] <= '9') j++;
-  if (j == i) return false;
-  out = (uint32_t)body.substring(i, j).toInt();
+  uint64_t acc = 0;
+  int digits = 0;
+  while (j < (int)body.length() && body[j] >= '0' && body[j] <= '9') {
+    acc = acc * 10ULL + (uint64_t)(body[j] - '0');
+    if (acc > 0xFFFFFFFFULL) return false;
+    digits++;
+    j++;
+  }
+  if (digits == 0) return false;
+  if (j < (int)body.length()) {
+    char term = body[j];
+    if (term != '}' && term != ',' && term != ' ' && term != '\t' &&
+        term != '\r' && term != '\n') return false;
+  }
+  out = (uint32_t)acc;
   return true;
 }
 
@@ -1217,7 +1294,7 @@ static void handlePostAp() {
   if (ch < 1 || ch > 13) { sendJsonErr("bad channel"); return; }
   if (hidden > 1) { sendJsonErr("bad hidden"); return; }
   if (maxc < 1 || maxc > 8) { sendJsonErr("bad max"); return; }
-  if (tx > 84) { sendJsonErr("bad tx"); return; }
+  if (tx < 8 || tx > 84) { sendJsonErr("bad tx"); return; }
   bool changed = (strcmp(gCfg.apSsid, ssid.c_str()) != 0) ||
                  (gCfg.apAuth != (uint8_t)auth) ||
                  (gCfg.apChannel != (uint8_t)ch) ||
@@ -1285,6 +1362,7 @@ static void handlePostSta() {
     if (c == '"' || c == '\\' || c < 0x20 || c == 0x7F) { sendJsonErr("ssid charset"); return; }
   }
   if (pass.length() > 63) { sendJsonErr("bad pass"); return; }
+  if (pass.length() > 0 && pass.length() < 8) { sendJsonErr("pass must be 8-63 chars"); return; }
   if (host.length() > 32) { sendJsonErr("bad host"); return; }
   for (size_t i = 0; i < host.length(); i++) {
     uint8_t c = (uint8_t)host[i];
@@ -1329,16 +1407,24 @@ static void handlePostSta() {
                  (gCfg.staUseMac != (uint8_t)useMac);
   strncpy(gCfg.staSsid, ssid.c_str(), sizeof(gCfg.staSsid) - 1);
   gCfg.staSsid[32] = 0;
-  if (pass.length() > 0) {
+  if (ssid.length() == 0) {
+    if (gCfg.staPass[0] != 0) { changed = true; }
+    gCfg.staPass[0] = 0;
+  } else if (pass.length() > 0) {
     strncpy(gCfg.staPass, pass.c_str(), sizeof(gCfg.staPass) - 1);
     gCfg.staPass[64] = 0;
   }
   gCfg.staDhcp = (uint8_t)dhcp;
-  gCfg.staIp = strToIp(ip);
-  gCfg.staGw = strToIp(gw);
-  gCfg.staMask = strToIp(mask);
-  gCfg.staDns1 = strToIp(dns1);
-  gCfg.staDns2 = strToIp(dns2);
+  if (dhcp == 1) {
+    gCfg.staIp = gCfg.staGw = gCfg.staMask = 0;
+    gCfg.staDns1 = gCfg.staDns2 = 0;
+  } else {
+    gCfg.staIp = strToIp(ip);
+    gCfg.staGw = strToIp(gw);
+    gCfg.staMask = strToIp(mask);
+    gCfg.staDns1 = strToIp(dns1);
+    gCfg.staDns2 = strToIp(dns2);
+  }
   strncpy(gCfg.staHostname, host.c_str(), sizeof(gCfg.staHostname) - 1);
   gCfg.staHostname[32] = 0;
   gCfg.staUseMac = (uint8_t)useMac;
@@ -1369,9 +1455,18 @@ static void handleSys() {
     case ESP_RST_SDIO:     rst = "sdio"; break;
     default: break;
   }
+  static uint32_t sLastMillis = 0;
+  static uint64_t sUpSec = 0;
+  uint32_t nowMs = millis();
+  uint32_t delta = nowMs - sLastMillis;
+  sLastMillis = nowMs;
+  sUpSec += (uint64_t)delta / 1000;
+  static uint32_t sFracMs = 0;
+  sFracMs += delta % 1000;
+  if (sFracMs >= 1000) { sUpSec += sFracMs / 1000; sFracMs %= 1000; }
   snprintf(gJsonBuf, sizeof(gJsonBuf),
-    "{\"up\":%lu,\"heap\":%u,\"heapMin\":%u,\"rst\":\"%s\"}",
-    (unsigned long)(millis() / 1000),
+    "{\"up\":%llu,\"heap\":%u,\"heapMin\":%u,\"rst\":\"%s\"}",
+    (unsigned long long)sUpSec,
     (unsigned)ESP.getFreeHeap(),
     (unsigned)ESP.getMinFreeHeap(),
     rst);
@@ -1407,6 +1502,13 @@ static void handleNotFound() {
   IPAddress apAddr = WiFi.softAPIP();
   if (apAddr == IPAddress(0, 0, 0, 0)) apAddr = IPAddress(192, 168, 4, 1);
   String host  = gServer.hostHeader();
+  if (host.length() > 0 && host[0] == '[') {
+    int close = host.indexOf(']');
+    if (close > 0) host = host.substring(1, close);
+  } else {
+    int colon = host.indexOf(':');
+    if (colon >= 0) host = host.substring(0, colon);
+  }
   String apIp  = apAddr.toString();
   String staIp = (WiFi.status() == WL_CONNECTED)
                    ? WiFi.localIP().toString() : "";
@@ -1434,6 +1536,7 @@ void setup() {
   relayApplyPin();
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(false);
   WiFi.setSleep(false);
   WiFi.softAPsetHostname("esp32-ap");
   if (gCfg.apAuth && strlen(gCfg.apPass) >= 8) {
