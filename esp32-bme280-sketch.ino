@@ -87,6 +87,7 @@ static bool       gStaWantConnect    = false;
 static uint32_t   gStaLastAttempt    = 0;
 static uint32_t   gStaAttemptGap     = STA_BACKOFF_STEP;
 static uint16_t   gStaFailCount      = 0;
+static uint32_t   gStaHardFailCount  = 0;
 static wl_status_t gStaLastStatus    = WL_IDLE_STATUS;
 static WebServer  gServer(80);
 static DNSServer  gDns;
@@ -170,6 +171,15 @@ static bool cfgValid(const Config& c) {
   if ((c.hMax - c.hMin) <= (2.0f * RELAY_HYST_H)) return false;
   if ((c.pMax - c.pMin) <= (2.0f * RELAY_HYST_P)) return false;
   if (c.relayEnabled > 1) return false;
+  if (c.staUseMac) {
+    if (c.staMac[0] & 0x01) return false;
+    bool all0 = true, allF = true;
+    for (int i = 0; i < 6; i++) {
+      if (c.staMac[i]) all0 = false;
+      if (c.staMac[i] != 0xFF) allF = false;
+    }
+    if (all0 || allF) return false;
+  }
   if (c.relayInvert  > 1) return false;
   if (c.relayUseT    > 1) return false;
   if (c.relayUseH    > 1) return false;
@@ -297,6 +307,7 @@ static void bmeTick(uint32_t now) {
       if (ok) {
         gBmeOk = true;
         gBmeWasOk = true;
+        sRecoverAttempts = 0;
         gBme.setSampling(Adafruit_BME280::MODE_NORMAL,
                          Adafruit_BME280::SAMPLING_X2,
                          Adafruit_BME280::SAMPLING_X16,
@@ -393,7 +404,7 @@ static void applyApConfig() {
   wifi_config_t wc;
   memset(&wc, 0, sizeof(wc));
   esp_wifi_get_config(WIFI_IF_AP, &wc);
-  strncpy((char*)wc.ap.ssid, gCfg.apSsid, sizeof(wc.ap.ssid));
+  memcpy(wc.ap.ssid, gCfg.apSsid, sizeof(wc.ap.ssid));
   wc.ap.ssid_len = strlen(gCfg.apSsid);
   if (gCfg.apAuth && strlen(gCfg.apPass) >= 8) {
     strncpy((char*)wc.ap.password, gCfg.apPass, sizeof(wc.ap.password) - 1);
@@ -402,14 +413,16 @@ static void applyApConfig() {
   } else {
     memset(wc.ap.password, 0, sizeof(wc.ap.password));
     wc.ap.authmode = WIFI_AUTH_OPEN;
-    gCfg.apPass[0] = 0;
   }
   wc.ap.channel = gCfg.apChannel;
   wc.ap.ssid_hidden = gCfg.apHidden ? 1 : 0;
   wc.ap.max_connection = gCfg.apMaxConn;
   wc.ap.beacon_interval = 100;
   esp_wifi_set_config(WIFI_IF_AP, &wc);
-  esp_wifi_set_max_tx_power(gCfg.apTxPower);
+  int8_t txp = gCfg.apTxPower;
+  if (txp < 8)  txp = 8;
+  if (txp > 84) txp = 84;
+  esp_wifi_set_max_tx_power(txp);
 }
 
 static void applyStaStaticIp() {
@@ -424,7 +437,8 @@ static void staBegin() {
     gStaWantConnect = false;
     return;
   }
-  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect(false, false);
   if (gCfg.staUseMac) {
     esp_err_t macErr = esp_wifi_set_mac(WIFI_IF_STA, (uint8_t*)gCfg.staMac);
     if (macErr != ESP_OK) {
@@ -437,11 +451,12 @@ static void staBegin() {
   }
   applyStaStaticIp();
   WiFi.begin(gCfg.staSsid, gCfg.staPass);
-  gStaWantConnect = true;
-  gStaLastAttempt = millis();
-  gStaAttemptGap = STA_BACKOFF_STEP;
-  gStaFailCount  = 0;
-  gStaLastStatus = WL_IDLE_STATUS;
+  gStaWantConnect   = true;
+  gStaLastAttempt   = millis();
+  gStaAttemptGap    = STA_BACKOFF_STEP;
+  gStaFailCount     = 0;
+  gStaHardFailCount = 0;
+  gStaLastStatus    = WL_IDLE_STATUS;
 }
 
 static void staTick(uint32_t now) {
@@ -450,25 +465,33 @@ static void staTick(uint32_t now) {
   if (s != gStaLastStatus) {
     gStaLastStatus = s;
     if (s == WL_CONNECTED) {
-      gStaAttemptGap = STA_BACKOFF_STEP;
-      gStaFailCount  = 0;
+      gStaAttemptGap    = STA_BACKOFF_STEP;
+      gStaFailCount     = 0;
+      gStaHardFailCount = 0;
     }
   }
-  if (s != WL_CONNECTED &&
-      (uint32_t)(now - gStaLastAttempt) >= gStaAttemptGap) {
-    gStaLastAttempt = now;
-    if (gStaAttemptGap < STA_BACKOFF_MAX) {
-      gStaAttemptGap += STA_BACKOFF_STEP;
-      if (gStaAttemptGap > STA_BACKOFF_MAX) gStaAttemptGap = STA_BACKOFF_MAX;
-    }
-    gStaFailCount++;
-    if (gStaFailCount >= 12) {
-      gStaFailCount = 0;
-      WiFi.disconnect(true, false);
-      WiFi.begin(gCfg.staSsid, gCfg.staPass);
-    } else {
-      WiFi.reconnect();
-    }
+  if (s == WL_CONNECTED) return;
+  uint32_t gap = gStaAttemptGap;
+  if (gStaHardFailCount >= 48) gap = 300000UL; 
+  if ((uint32_t)(now - gStaLastAttempt) < gap) return;
+  gStaLastAttempt = now;
+  if (gStaHardFailCount >= 48) {
+    gStaHardFailCount++;
+    WiFi.reconnect();
+    return;
+  }
+  if (gStaAttemptGap < STA_BACKOFF_MAX) {
+    gStaAttemptGap += STA_BACKOFF_STEP;
+    if (gStaAttemptGap > STA_BACKOFF_MAX) gStaAttemptGap = STA_BACKOFF_MAX;
+  }
+  gStaFailCount++;
+  gStaHardFailCount++;
+  if (gStaFailCount >= 12) {
+    gStaFailCount = 0;
+    WiFi.disconnect(false, false);
+    WiFi.begin(gCfg.staSsid, gCfg.staPass);
+  } else {
+    WiFi.reconnect();
   }
 }
 
@@ -532,6 +555,7 @@ static bool strToMac(const String& s, uint8_t m[6]) {
     if (m[i] != 0xFF) allF = false;
   }
   if (all0 || allF) return false;
+  if (m[0] & 0x01) return false;
   return true;
 }
 
@@ -637,12 +661,12 @@ td{padding:6px 4px;border-bottom:1px solid #334155;word-break:break-all}
 <section id="p-ap" class="hide">
 <div class="card"><h2>WiFi AP Settings</h2>
 <div class="row"><label>SSID</label><input id="apSsid" maxlength="32"></div>
-<div class="row"><label>Password</label><input id="apPass" maxlength="64" type="password"></div>
+<div class="row"><label>Password</label><input id="apPass" maxlength="63" minlength="8" type="password"></div>
 <div class="row"><label>Authentication</label><select id="apAuth"><option value="1">WPA2</option><option value="0">Open</option></select></div>
 <div class="row"><label>Channel</label><select id="apCh"></select></div>
 <div class="row"><label>Hidden SSID</label><select id="apHidden"><option value="0">No</option><option value="1">Yes</option></select></div>
 <div class="row"><label>Max clients</label><input id="apMax" type="number" min="1" max="8"></div>
-<div class="row"><label>TX power (0-84)</label><input id="apTx" type="number" min="0" max="84"></div>
+<div class="row"><label>TX power (8-84 = 2-21 dBm)</label><input id="apTx" type="number" min="8" max="84"></div>
 <button class="act" id="apSave">Apply AP</button>
 <span class="status" id="apMsg"></span>
 </div>
@@ -677,6 +701,7 @@ td{padding:6px 4px;border-bottom:1px solid #334155;word-break:break-all}
 </table>
 </div>
 <div class="card"><h2>Change Admin Password</h2>
+<div class="status" style="opacity:.75;margin-bottom:8px">Login username: <b>admin</b> (fixed)</div>
 <div class="row"><label>New password</label><input id="newAuth" type="password" maxlength="32"></div>
 <button class="act" id="btnAuth">Change Password</button>
 <span class="status" id="authMsg"></span>
@@ -709,7 +734,7 @@ function idle(){
   while(busyTimers.length){clearTimeout(busyTimers.shift());}
   inflight=0;
 }
-function api(path,opts){return fetch(path,opts).then(function(r){return r.json();});}
+function api(path,opts){return fetch(path,opts).then(function(r){if(r.status===401){var e=new Error('auth');e.auth=true;throw e;}return r.json();});}
 function showBanner(){rebootNeeded=true;$('rebootBanner').classList.add('show');}
 function overlay(msg,color){
   var btns=document.querySelectorAll('button');
@@ -754,9 +779,13 @@ document.querySelectorAll('nav button').forEach(function(b){
 });
 (function(){var s=$('apCh');for(var i=1;i<=13;i++){var o=document.createElement('option');o.value=i;o.textContent=i;s.appendChild(o);}})();
 function num2(v){return (typeof v==='number')?v.toFixed(1):'--';}
+function dimMetrics(on){
+  ['mT','mH','mP'].forEach(function(k){var e=$(k);if(e)e.style.opacity=on?'0.4':'1';});
+}
 function refreshDash(){
   api('/api/status').then(function(d){
     failCount=0;
+    dimMetrics(false);
     $('sensorStatus').classList.remove('er');
     $('mT').textContent=num2(d.t);
     $('mH').textContent=num2(d.h);
@@ -765,7 +794,14 @@ function refreshDash(){
     $('cardT').className='metric'+((alertsOn&&d.tAlert)?' warn':'');
     $('cardH').className='metric'+((alertsOn&&d.hAlert)?' warn':'');
     $('cardP').className='metric'+((alertsOn&&d.pAlert)?' warn':'');
-    if(d.sensorOk){$('sensorStatus').innerHTML='<span class="ok">Sensor OK at 0x'+d.sensorAddr.toString(16).toUpperCase()+'</span>';}
+    if(d.sensorOk){
+      var addr=(typeof d.sensorAddr==='number')?d.sensorAddr.toString(16).toUpperCase():'??';
+      if(d.sensorPartial){
+        $('sensorStatus').innerHTML='<span class="wn">Sensor partial at 0x'+addr+' (some metrics unavailable)</span>';
+      }else{
+        $('sensorStatus').innerHTML='<span class="ok">Sensor OK at 0x'+addr+'</span>';
+      }
+    }
     else{$('sensorStatus').innerHTML='<span class="er">Sensor not detected</span>';}
     var al=[];
     if(alertsOn&&d.tAlert)al.push('Temperature out of range');
@@ -787,9 +823,13 @@ function refreshDash(){
     $('nStaIp').textContent=d.staIp;
     $('nStaRssi').textContent=(d.staStatus==='connected')?(d.staRssi+' dBm'):'—';
     $('nHost').textContent=d.hostname;
-  }).catch(function(){
+  }).catch(function(e){
     failCount++;
-    if(failCount>=3){
+    if(e&&e.auth){
+      dimMetrics(true);
+      $('sensorStatus').innerHTML='<span class="er">Session expired — reload page</span>';
+    } else if(failCount>=3){
+      dimMetrics(true);
       $('sensorStatus').innerHTML='<span class="er">Connection lost — values stale</span>';
     }
   });
@@ -815,6 +855,7 @@ function parseField(id,name,min,max){
   var el=$(id);
   var raw=el.value.trim();
   if(raw===''){return {err:name+' is required'};}
+  if(!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(raw)){return {err:name+' must be a decimal number'};}
   var v=Number(raw);
   if(isNaN(v)||!isFinite(v)){return {err:name+' must be a number'};}
   if(v<min||v>max){return {err:name+' must be between '+min+' and '+max};}
@@ -832,6 +873,9 @@ $('thrSave').onclick=function(){
   if(tMin.v>=tMax.v){$('thrMsg').innerHTML='<span class="er">Temp min must be less than Temp max</span>';return;}
   if(hMin.v>=hMax.v){$('thrMsg').innerHTML='<span class="er">Humidity min must be less than Humidity max</span>';return;}
   if(pMin.v>=pMax.v){$('thrMsg').innerHTML='<span class="er">Pressure min must be less than Pressure max</span>';return;}
+  if((tMax.v-tMin.v)<=1.0){$('thrMsg').innerHTML='<span class="er">Temperature range must span more than 1.0 °C</span>';return;}
+  if((hMax.v-hMin.v)<=2.0){$('thrMsg').innerHTML='<span class="er">Humidity range must span more than 2.0 %</span>';return;}
+  if((pMax.v-pMin.v)<=1.0){$('thrMsg').innerHTML='<span class="er">Pressure range must span more than 1.0 hPa</span>';return;}
   var body=JSON.stringify({en:+$('thrEn').value,tMin:tMin.v,tMax:tMax.v,hMin:hMin.v,hMax:hMax.v,pMin:pMin.v,pMax:pMax.v});
   $('thrMsg').innerHTML='<span>Saving...</span>';
   busy();
@@ -864,7 +908,7 @@ function loadAp(){
   api('/api/ap').then(function(d){
     $('apSsid').value=d.ssid;
     $('apPass').value='';
-    $('apPass').placeholder=d.auth?'(unchanged if empty)':'(open)';
+    $('apPass').placeholder=!d.auth?'(open — no password)':(d.hasPass?'(unchanged if empty)':'(required, 8-63 chars)');
     $('apAuth').value=d.auth;$('apCh').value=d.ch;
     $('apHidden').value=d.hidden;$('apMax').value=d.max;
     $('apTx').value=d.tx;
@@ -921,7 +965,7 @@ $('staSave').onclick=function(){
 };
 function loadSys(){
   api('/api/sys').then(function(d){
-    var s=d.up,total=s,d2=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60;
+    var s=d.up,d2=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60;
     var parts=[];
     if(d2>0)parts.push(d2+'d');
     if(h>0)parts.push(h+'h');
@@ -931,27 +975,39 @@ function loadSys(){
     $('sHeap').textContent=d.heap+' bytes';
     $('sHeapMin').textContent=d.heapMin+' bytes';
     $('sRst').textContent=d.rst;
-  }).catch(function(){});
+  }).catch(function(e){
+    if(e&&e.auth){
+      $('sUp').textContent='session expired';
+      $('sHeap').textContent='—';
+      $('sHeapMin').textContent='—';
+      $('sRst').textContent='—';
+    } else {
+      $('sUp').textContent='connection lost';
+    }
+  });
 }
+var authBusy=false;
 $('btnAuth').onclick=function(){
+  if(authBusy){return;}
   var p=$('newAuth').value;
+  if(p.length===0){$('authMsg').innerHTML='<span class="wn">Enter a new password (8-32 chars)</span>';return;}
   if(p.length<8){$('authMsg').innerHTML='<span class="er">Min 8 chars</span>';return;}
+  if(p.length>32){$('authMsg').innerHTML='<span class="er">Max 32 chars</span>';return;}
   $('authMsg').textContent='';
+  authBusy=true;
   api('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pass:p})}).then(function(d){
     if(d.ok){$('authMsg').innerHTML='<span class="ok">Changed. Reload page to log in.</span>';$('newAuth').value='';}
     else{$('authMsg').innerHTML='<span class="er">Failed</span>';}
-  }).catch(function(){$('authMsg').innerHTML='<span class="er">Network error</span>';});
+  }).catch(function(){$('authMsg').innerHTML='<span class="er">Network error</span>';}).then(function(){authBusy=false;});
 };
 $('btnReboot').onclick=function(){if(confirm('Reboot?'))doReboot();};
 $('btnFactory').onclick=function(){
   var a=prompt('Type RESET to erase ALL settings and reboot:');
   if(a!=='RESET'){return;}
-  overlay('Factory reset in progress...','#7c2d12');
+  overlay('Factory reset in progress... Reconnect to WiFi "ESP32-BME280" (password 12345678), then open http://192.168.4.1/','#7c2d12');
   api('/api/factory',{method:'POST'}).catch(function(){}).then(function(){
     setTimeout(function(){
-      var host=location.hostname;
-      if(!host||host==='0.0.0.0'){host='192.168.4.1';}
-      location.href='http://'+host+'/';
+      location.href='http://192.168.4.1/';
     },10000);
   });
 };
@@ -985,6 +1041,11 @@ static void sendJsonErr(const char* e) {
   gServer.send(400, "application/json", gJsonBuf);
 }
 
+static void sendJsonNoStore(int code) {
+  gServer.sendHeader("Cache-Control", "no-store");
+  gServer.send(code, "application/json", gJsonBuf);
+}
+
 static void handleStatus() {
   if (!checkAuth()) return;
   wl_status_t staNow = WiFi.status();
@@ -997,7 +1058,7 @@ static void handleStatus() {
   if (isnan(gP)) strcpy(pB, "null"); else snprintf(pB, sizeof(pB), "%.2f", gP);
   snprintf(gJsonBuf, sizeof(gJsonBuf),
     "{\"t\":%s,\"h\":%s,\"p\":%s,\"tAlert\":%s,\"hAlert\":%s,\"pAlert\":%s,"
-    "\"alertsEn\":%u,\"sensorOk\":%s,\"sensorAddr\":%u,"
+    "\"alertsEn\":%u,\"sensorOk\":%s,\"sensorAddr\":%u,\"sensorPartial\":%s,"
     "\"apSsid\":\"%s\",\"apIp\":\"%s\",\"apClients\":%d,"
     "\"staStatus\":\"%s\",\"staIp\":\"%s\",\"staRssi\":%d,\"hostname\":\"%s\","
     "\"relayOn\":%s,\"relayEn\":%u}",
@@ -1008,6 +1069,7 @@ static void handleStatus() {
     (unsigned)gCfg.alertsEnabled,
     gBmeOk ? "true" : "false",
     (unsigned)gBmeAddr,
+    (gBmeOk && (isnan(gT) || isnan(gH) || isnan(gP))) ? "true" : "false",
     gCfg.apSsid,
     WiFi.softAPIP().toString().c_str(),
     WiFi.softAPgetStationNum(),
@@ -1018,7 +1080,7 @@ static void handleStatus() {
     gRelayState ? "true" : "false",
     (unsigned)gCfg.relayEnabled
   );
-  gServer.send(200, "application/json", gJsonBuf);
+  sendJsonNoStore(200);
 }
 
 static bool jsonGetFloat(const String& body, const char* key, float& out) {
@@ -1082,7 +1144,7 @@ static void handleGetThr() {
     (unsigned)gCfg.relayEnabled, (unsigned)gCfg.relayInvert,
     (unsigned)gCfg.relayUseT, (unsigned)gCfg.relayUseH,
     (unsigned)gCfg.relayUseP, (unsigned)gCfg.relayLogic);
-  gServer.send(200, "application/json", gJsonBuf);
+  sendJsonNoStore(200);
 }
 
 static void handlePostThr() {
@@ -1116,7 +1178,7 @@ static void handlePostThr() {
   gCfg.pMin = pMin; gCfg.pMax = pMax;
   if (changed) {
     cfgMarkDirty();
-    saveConfigForce();
+    if (!saveConfigForce()) { sendJsonErr("nvs save failed"); return; }
   }
   relayTick();
   sendJsonOk();
@@ -1152,8 +1214,9 @@ static void handlePostRelay() {
   gCfg.relayLogic   = (uint8_t)logic;
   if (changed) {
     cfgMarkDirty();
-    saveConfigForce();
+    if (!saveConfigForce()) { sendJsonErr("nvs save failed"); return; }
   }
+  relayApplyPin();
   relayTick();
   sendJsonOk();
 }
@@ -1161,10 +1224,11 @@ static void handlePostRelay() {
 static void handleGetAp() {
   if (!checkAuth()) return;
   snprintf(gJsonBuf, sizeof(gJsonBuf),
-    "{\"ssid\":\"%s\",\"pass\":\"\",\"auth\":%u,\"ch\":%u,\"hidden\":%u,\"max\":%u,\"tx\":%d}",
-    gCfg.apSsid, gCfg.apAuth, gCfg.apChannel,
+    "{\"ssid\":\"%s\",\"pass\":\"\",\"hasPass\":%s,\"auth\":%u,\"ch\":%u,\"hidden\":%u,\"max\":%u,\"tx\":%d}",
+    gCfg.apSsid, (gCfg.apAuth && strlen(gCfg.apPass) >= 8) ? "true" : "false",
+    gCfg.apAuth, gCfg.apChannel,
     gCfg.apHidden, gCfg.apMaxConn, gCfg.apTxPower);
-  gServer.send(200, "application/json", gJsonBuf);
+  sendJsonNoStore(200);
 }
 
 static void handlePostAp() {
@@ -1184,8 +1248,8 @@ static void handlePostAp() {
     if (c == '"' || c == '\\' || c < 0x20 || c == 0x7F) { sendJsonErr("ssid charset"); return; }
   }
   if (auth > 1) { sendJsonErr("bad auth"); return; }
-  if (auth == 1 && pass.length() > 0 && (pass.length() < 8 || pass.length() > 63)) { sendJsonErr("bad pass"); return; }
-  if (auth == 1 && pass.length() == 0 && strlen(gCfg.apPass) < 8) { sendJsonErr("bad pass"); return; }
+  if (auth == 1 && pass.length() > 0 && (pass.length() < 8 || pass.length() > 63)) { sendJsonErr("password must be 8-63 chars"); return; }
+  if (auth == 1 && pass.length() == 0 && strlen(gCfg.apPass) < 8) { sendJsonErr("password required for WPA2"); return; }
   if (ch < 1 || ch > 13) { sendJsonErr("bad channel"); return; }
   if (hidden > 1) { sendJsonErr("bad hidden"); return; }
   if (maxc < 1 || maxc > 8) { sendJsonErr("bad max"); return; }
@@ -1199,7 +1263,10 @@ static void handlePostAp() {
                  (pass.length() > 0 && strcmp(gCfg.apPass, pass.c_str()) != 0);
   strncpy(gCfg.apSsid, ssid.c_str(), sizeof(gCfg.apSsid) - 1);
   gCfg.apSsid[32] = 0;
-  if (pass.length() > 0) {
+  if (auth == 0) {
+    if (gCfg.apPass[0] != 0) changed = true;
+    gCfg.apPass[0] = 0;
+  } else if (pass.length() > 0) {
     strncpy(gCfg.apPass, pass.c_str(), sizeof(gCfg.apPass) - 1);
     gCfg.apPass[64] = 0;
   }
@@ -1210,7 +1277,7 @@ static void handlePostAp() {
   gCfg.apTxPower = (int8_t)tx;
   if (changed) {
     cfgMarkDirty();
-    saveConfigForce();
+    if (!saveConfigForce()) { sendJsonErr("nvs save failed"); return; }
   }
   applyApConfig();
   sendJsonOk();
@@ -1229,7 +1296,7 @@ static void handleGetSta() {
     ipToStr(gCfg.staMask).c_str(), ipToStr(gCfg.staDns1).c_str(),
     ipToStr(gCfg.staDns2).c_str(), gCfg.staHostname,
     gCfg.staUseMac, mac);
-  gServer.send(200, "application/json", gJsonBuf);
+  sendJsonNoStore(200);
 }
 
 static void handlePostSta() {
@@ -1266,8 +1333,13 @@ static void handlePostSta() {
       sendJsonErr("bad static ip"); return;
     }
     uint32_t uip = strToIp(ip), ugw = strToIp(gw), umask = strToIp(mask);
+    if (umask == 0) { sendJsonErr("bad mask"); return; }
+    uint32_t inv = ~umask;
+    if ((inv & (inv + 1)) != 0) { sendJsonErr("mask not contiguous"); return; }
     if ((uip & umask) == 0) { sendJsonErr("ip/mask"); return; }
     if ((ugw & umask) != (uip & umask)) { sendJsonErr("gw subnet"); return; }
+    if (dns1.length() && strToIp(dns1) == 0) { sendJsonErr("bad dns1"); return; }
+    if (dns2.length() && strToIp(dns2) == 0) { sendJsonErr("bad dns2"); return; }
   }
 
   bool macChanged = false;
@@ -1309,7 +1381,7 @@ static void handlePostSta() {
   if (useMac) memcpy(gCfg.staMac, newMac, 6);
   if (changed) {
     cfgMarkDirty();
-    saveConfigForce();
+    if (!saveConfigForce()) { sendJsonErr("nvs save failed"); return; }
   }
   bool rebootRequired = macChanged || ipChanged || credChanged || hostChanged;
   snprintf(gJsonBuf, sizeof(gJsonBuf),
@@ -1339,7 +1411,7 @@ static void handleSys() {
     (unsigned)ESP.getFreeHeap(),
     (unsigned)ESP.getMinFreeHeap(),
     rst);
-  gServer.send(200, "application/json", gJsonBuf);
+  sendJsonNoStore(200);
 }
 
 static void handleReboot() {
@@ -1367,9 +1439,6 @@ static void handleAuth() {
   if (!jsonGetStr(body, "pass", pass) || pass.length() < 8 || pass.length() > 32) {
     sendJsonErr("bad pass"); return;
   }
-  char oldPass[33];
-  strncpy(oldPass, gAuthPass, sizeof(oldPass) - 1);
-  oldPass[sizeof(oldPass) - 1] = 0;
   char newPass[33];
   strncpy(newPass, pass.c_str(), sizeof(newPass) - 1);
   newPass[sizeof(newPass) - 1] = 0;
@@ -1379,8 +1448,6 @@ static void handleAuth() {
   }
   size_t written = gPrefs.putString(CFG_KEY_AUTH, newPass);
   if (written != strlen(newPass)) {
-    strncpy(gAuthPass, oldPass, sizeof(gAuthPass) - 1);
-    gAuthPass[sizeof(gAuthPass) - 1] = 0;
     sendJsonErr("nvs write failed");
     return;
   }
@@ -1443,13 +1510,14 @@ void setup() {
   gDnsStarted = true;
   bmeInit();
   gBmeLastRead = millis();
-  gPrefs.begin(CFG_NS, false);
-  String ap = gPrefs.getString(CFG_KEY_AUTH, "");
-  if (ap.length() >= 8) {
-    strncpy(gAuthPass, ap.c_str(), sizeof(gAuthPass) - 1);
-    gAuthPass[32] = 0;
-  } else {
-    gPrefs.putString(CFG_KEY_AUTH, gAuthPass);
+  if (gPrefs.begin(CFG_NS, false)) {
+    String ap = gPrefs.getString(CFG_KEY_AUTH, "");
+    if (ap.length() >= 8) {
+      strncpy(gAuthPass, ap.c_str(), sizeof(gAuthPass) - 1);
+      gAuthPass[32] = 0;
+    } else {
+      gPrefs.putString(CFG_KEY_AUTH, gAuthPass);
+    }
   }
   gServer.on("/", HTTP_GET, sendHtml);
   gServer.on("/api/status", HTTP_GET, handleStatus);
