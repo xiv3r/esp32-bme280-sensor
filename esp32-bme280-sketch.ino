@@ -17,9 +17,10 @@
 #define PIN_I2C_SCL   22
 #define PIN_BOOT_BTN   0
 #define PIN_LED        2
+#define PIN_RELAY     25
 
 #define CFG_MAGIC     0x45535034UL
-#define CFG_VERSION   2
+#define CFG_VERSION   3
 #define CFG_NS        "espcfg"
 #define CFG_KEY_A     "cfgA"
 #define CFG_KEY_B     "cfgB"
@@ -32,9 +33,13 @@
 #define CFG_WRITE_MIN_MS   60000UL
 #define STA_BACKOFF_MAX    30000UL
 #define STA_BACKOFF_STEP    5000UL
-#define JSON_BUF_SZ          768
+#define JSON_BUF_SZ          896
 #define REBOOT_DELAY_MS      500
 #define FACTORY_DELAY_MS     800
+
+#define RELAY_HYST_T  0.5f
+#define RELAY_HYST_H  1.0f
+#define RELAY_HYST_P  0.5f
 
 struct __attribute__((packed)) Config {
   uint32_t magic;
@@ -59,6 +64,13 @@ struct __attribute__((packed)) Config {
 
   float    tMin, tMax, hMin, hMax, pMin, pMax;
   uint8_t  alertsEnabled;
+
+  uint8_t  relayEnabled;
+  uint8_t  relayInvert;
+  uint8_t  relayUseT;
+  uint8_t  relayUseH;
+  uint8_t  relayUseP;
+  uint8_t  relayLogic;
 };
 
 static Config     gCfg;
@@ -81,6 +93,8 @@ static bool       gBmeWasOk          = false;
 static uint32_t   gBmeLastRead       = 0;
 
 static float      gT = NAN, gH = NAN, gP = NAN;
+
+static bool       gRelayState        = false;
 
 static bool       gStaWantConnect    = false;
 static uint32_t   gStaLastAttempt    = 0;
@@ -136,6 +150,13 @@ static void setDefaults(Config& c) {
   c.pMin = 300; c.pMax = 1100;
   c.alertsEnabled = 1;
 
+  c.relayEnabled = 0;
+  c.relayInvert  = 0;
+  c.relayUseT    = 1;
+  c.relayUseH    = 1;
+  c.relayUseP    = 0;
+  c.relayLogic   = 0;
+
   c.crc = cfgCrc(c);
 }
 
@@ -165,6 +186,12 @@ static bool cfgValid(const Config& c) {
   if (c.tMin >= c.tMax) return false;
   if (c.hMin >= c.hMax) return false;
   if (c.pMin >= c.pMax) return false;
+  if (c.relayEnabled > 1) return false;
+  if (c.relayInvert  > 1) return false;
+  if (c.relayUseT    > 1) return false;
+  if (c.relayUseH    > 1) return false;
+  if (c.relayUseP    > 1) return false;
+  if (c.relayLogic   > 1) return false;
   return true;
 }
 
@@ -282,6 +309,72 @@ static void bmeTick(uint32_t now) {
     gT = NAN;
     gH = NAN;
     gP = NAN;
+  }
+}
+
+static bool relayShouldBeOn() {
+  if (!gCfg.relayEnabled) return false;
+
+  const bool useT = gCfg.relayUseT;
+  const bool useH = gCfg.relayUseH;
+  const bool useP = gCfg.relayUseP;
+  if (!useT && !useH && !useP) return false;
+
+  int vT = 0, vH = 0, vP = 0;
+
+  if (useT && !isnan(gT)) {
+    bool rawOut = (gT < gCfg.tMin || gT > gCfg.tMax);
+    bool inBand = (gT >= gCfg.tMin + RELAY_HYST_T &&
+                   gT <= gCfg.tMax - RELAY_HYST_T);
+    if (rawOut)      vT =  1;
+    else if (inBand) vT = -1;
+  }
+  if (useH && !isnan(gH)) {
+    bool rawOut = (gH < gCfg.hMin || gH > gCfg.hMax);
+    bool inBand = (gH >= gCfg.hMin + RELAY_HYST_H &&
+                   gH <= gCfg.hMax - RELAY_HYST_H);
+    if (rawOut)      vH =  1;
+    else if (inBand) vH = -1;
+  }
+  if (useP && !isnan(gP)) {
+    bool rawOut = (gP < gCfg.pMin || gP > gCfg.pMax);
+    bool inBand = (gP >= gCfg.pMin + RELAY_HYST_P &&
+                   gP <= gCfg.pMax - RELAY_HYST_P);
+    if (rawOut)      vP =  1;
+    else if (inBand) vP = -1;
+  }
+
+  if (gCfg.relayLogic == 0) {
+    if (vT == 1 || vH == 1 || vP == 1) return true;
+
+    int evaluated = 0;
+    bool allInside = true;
+    if (useT && !isnan(gT)) { evaluated++; if (vT != -1) allInside = false; }
+    if (useH && !isnan(gH)) { evaluated++; if (vH != -1) allInside = false; }
+    if (useP && !isnan(gP)) { evaluated++; if (vP != -1) allInside = false; }
+    if (evaluated > 0 && allInside) return false;
+
+    return gRelayState;
+  }
+
+  bool haveAny = false, allOut = true;
+  if (useT) { if (isnan(gT)) return gRelayState; haveAny = true; if (vT != 1) allOut = false; }
+  if (useH) { if (isnan(gH)) return gRelayState; haveAny = true; if (vH != 1) allOut = false; }
+  if (useP) { if (isnan(gP)) return gRelayState; haveAny = true; if (vP != 1) allOut = false; }
+  if (!haveAny) return false;
+  return allOut;
+}
+
+static void relayApplyPin() {
+  bool pinHigh = gCfg.relayInvert ? !gRelayState : gRelayState;
+  digitalWrite(PIN_RELAY, pinHigh ? HIGH : LOW);
+}
+
+static void relayTick() {
+  bool want = relayShouldBeOn();
+  if (want != gRelayState) {
+    gRelayState = want;
+    relayApplyPin();
   }
 }
 
@@ -485,6 +578,7 @@ td{padding:6px 4px;border-bottom:1px solid #334155;word-break:break-all}
 </div>
 <div class="status" id="sensorStatus"></div>
 <div class="status" id="alertStatus"></div>
+<div class="status" id="relayStatus"></div>
 </div>
 <div class="card"><h2>Network</h2>
 <table>
@@ -510,6 +604,16 @@ td{padding:6px 4px;border-bottom:1px solid #334155;word-break:break-all}
 <div class="row"><label>Pressure max (hPa)</label><input id="thrPmax" type="number" step="0.1" min="300" max="1100"></div>
 <button class="act" id="thrSave">Save Thresholds</button>
 <span class="status" id="thrMsg"></span>
+</div>
+<div class="card"><h2>Relay (GPIO 25)</h2>
+<div class="row"><label>Relay enabled</label><select id="relayEn"><option value="0">No</option><option value="1">Yes</option></select></div>
+<div class="row"><label>Logic</label><select id="relayLogic"><option value="0">OR (any alert)</option><option value="1">AND (all alerts)</option></select></div>
+<div class="row"><label>React to temperature</label><select id="relayUseT"><option value="1">Yes</option><option value="0">No</option></select></div>
+<div class="row"><label>React to humidity</label><select id="relayUseH"><option value="1">Yes</option><option value="0">No</option></select></div>
+<div class="row"><label>React to pressure</label><select id="relayUseP"><option value="1">Yes</option><option value="0">No</option></select></div>
+<div class="row"><label>Active-low relay</label><select id="relayInv"><option value="0">No</option><option value="1">Yes</option></select></div>
+<button class="act" id="relaySave">Save Relay Settings</button>
+<span class="status" id="relayMsg"></span>
 </div>
 </section>
 
@@ -652,6 +756,13 @@ function refreshDash(){
     if(alertsOn&&d.pAlert)al.push('Pressure out of range');
     if(al.length){$('alertStatus').innerHTML='<span class="wn">'+al.join(' · ')+'</span>';}
     else{$('alertStatus').textContent='';}
+    if(d.relayEn){
+      $('relayStatus').innerHTML=d.relayOn
+        ?'<span class="wn">Relay: ON (GPIO 25)</span>'
+        :'<span class="ok">Relay: OFF (GPIO 25)</span>';
+    }else{
+      $('relayStatus').innerHTML='<span style="opacity:.6">Relay: disabled</span>';
+    }
     $('nApSsid').textContent=d.apSsid;
     $('nApIp').textContent=d.apIp;
     $('nApClients').textContent=d.apClients;
@@ -670,10 +781,17 @@ setInterval(function(){if(page==='dash')refreshDash();},2000);
 refreshDash();
 function loadThr(){
   $('thrMsg').textContent='';
+  $('relayMsg').textContent='';
   api('/api/thresholds').then(function(d){
     $('thrEn').value=d.en;$('thrTmin').value=d.tMin;$('thrTmax').value=d.tMax;
     $('thrHmin').value=d.hMin;$('thrHmax').value=d.hMax;
     $('thrPmin').value=d.pMin;$('thrPmax').value=d.pMax;
+    $('relayEn').value=d.relayEn;
+    $('relayLogic').value=d.relayLogic;
+    $('relayUseT').value=d.relayUseT;
+    $('relayUseH').value=d.relayUseH;
+    $('relayUseP').value=d.relayUseP;
+    $('relayInv').value=d.relayInv;
   });
 }
 function parseField(id,name,min,max){
@@ -704,6 +822,25 @@ $('thrSave').onclick=function(){
     if(d.ok){$('thrMsg').innerHTML='<span class="ok">Saved.</span>';}
     else{$('thrMsg').innerHTML='<span class="er">Error: '+d.err+'</span>';}
   }).catch(function(){$('thrMsg').innerHTML='<span class="er">Network error</span>';}).then(idle);
+};
+$('relaySave').onclick=function(){
+  if(inflight>0){$('relayMsg').innerHTML='<span class="wn">Please wait...</span>';return;}
+  $('relayMsg').textContent='';
+  var rEn=+$('relayEn').value;
+  var rT=+$('relayUseT').value,rH=+$('relayUseH').value,rP=+$('relayUseP').value;
+  if(rEn===1&&rT===0&&rH===0&&rP===0){
+    $('relayMsg').innerHTML='<span class="er">Select at least one metric</span>';return;
+  }
+  var body=JSON.stringify({
+    relayEn:rEn,relayLogic:+$('relayLogic').value,
+    relayUseT:rT,relayUseH:rH,relayUseP:rP,relayInv:+$('relayInv').value
+  });
+  $('relayMsg').innerHTML='<span>Saving...</span>';
+  busy();
+  api('/api/relay',{method:'POST',headers:{'Content-Type':'application/json'},body:body}).then(function(d){
+    if(d.ok){$('relayMsg').innerHTML='<span class="ok">Saved.</span>';}
+    else{$('relayMsg').innerHTML='<span class="er">Error: '+d.err+'</span>';}
+  }).catch(function(){$('relayMsg').innerHTML='<span class="er">Network error</span>';}).then(idle);
 };
 function loadAp(){
   $('apMsg').textContent='';
@@ -847,7 +984,8 @@ static void handleStatus() {
     "{\"t\":%s,\"h\":%s,\"p\":%s,\"tAlert\":%s,\"hAlert\":%s,\"pAlert\":%s,"
     "\"alertsEn\":%u,\"sensorOk\":%s,\"sensorAddr\":%u,"
     "\"apSsid\":\"%s\",\"apIp\":\"%s\",\"apClients\":%d,"
-    "\"staStatus\":\"%s\",\"staIp\":\"%s\",\"staRssi\":%d,\"hostname\":\"%s\"}",
+    "\"staStatus\":\"%s\",\"staIp\":\"%s\",\"staRssi\":%d,\"hostname\":\"%s\","
+    "\"relayOn\":%s,\"relayEn\":%u}",
     tB, hB, pB,
     tAlert ? "true" : "false",
     hAlert ? "true" : "false",
@@ -861,7 +999,9 @@ static void handleStatus() {
     WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
     WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-",
     WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
-    gCfg.staHostname
+    gCfg.staHostname,
+    gRelayState ? "true" : "false",
+    (unsigned)gCfg.relayEnabled
   );
   gServer.send(200, "application/json", gJsonBuf);
 }
@@ -921,8 +1061,12 @@ static bool jsonGetStr(const String& body, const char* key, String& out) {
 static void handleGetThr() {
   if (!checkAuth()) return;
   snprintf(gJsonBuf, sizeof(gJsonBuf),
-    "{\"en\":%u,\"tMin\":%.2f,\"tMax\":%.2f,\"hMin\":%.2f,\"hMax\":%.2f,\"pMin\":%.2f,\"pMax\":%.2f}",
-    (unsigned)gCfg.alertsEnabled, gCfg.tMin, gCfg.tMax, gCfg.hMin, gCfg.hMax, gCfg.pMin, gCfg.pMax);
+    "{\"en\":%u,\"tMin\":%.2f,\"tMax\":%.2f,\"hMin\":%.2f,\"hMax\":%.2f,\"pMin\":%.2f,\"pMax\":%.2f,"
+    "\"relayEn\":%u,\"relayInv\":%u,\"relayUseT\":%u,\"relayUseH\":%u,\"relayUseP\":%u,\"relayLogic\":%u}",
+    (unsigned)gCfg.alertsEnabled, gCfg.tMin, gCfg.tMax, gCfg.hMin, gCfg.hMax, gCfg.pMin, gCfg.pMax,
+    (unsigned)gCfg.relayEnabled, (unsigned)gCfg.relayInvert,
+    (unsigned)gCfg.relayUseT, (unsigned)gCfg.relayUseH,
+    (unsigned)gCfg.relayUseP, (unsigned)gCfg.relayLogic);
   gServer.send(200, "application/json", gJsonBuf);
 }
 
@@ -951,6 +1095,35 @@ static void handlePostThr() {
   gCfg.pMin = pMin; gCfg.pMax = pMax;
   cfgMarkDirty();
   saveConfigForce();
+  relayTick();
+  sendJsonOk();
+}
+
+static void handlePostRelay() {
+  if (!checkAuth()) return;
+  String body = gServer.arg("plain");
+  uint32_t en = 0, inv = 0, useT = 0, useH = 0, useP = 0, logic = 0;
+  if (!jsonGetUInt(body, "relayEn", en) || !jsonGetUInt(body, "relayInv", inv) ||
+      !jsonGetUInt(body, "relayUseT", useT) || !jsonGetUInt(body, "relayUseH", useH) ||
+      !jsonGetUInt(body, "relayUseP", useP) || !jsonGetUInt(body, "relayLogic", logic)) {
+    sendJsonErr("bad json"); return;
+  }
+  if (en > 1 || inv > 1 || useT > 1 || useH > 1 || useP > 1 || logic > 1) {
+    sendJsonErr("relay bool"); return;
+  }
+  if (en == 1 && useT == 0 && useH == 0 && useP == 0) {
+    sendJsonErr("relay: no metric selected"); return;
+  }
+
+  gCfg.relayEnabled = (uint8_t)en;
+  gCfg.relayInvert  = (uint8_t)inv;
+  gCfg.relayUseT    = (uint8_t)useT;
+  gCfg.relayUseH    = (uint8_t)useH;
+  gCfg.relayUseP    = (uint8_t)useP;
+  gCfg.relayLogic   = (uint8_t)logic;
+  cfgMarkDirty();
+  saveConfigForce();
+  relayTick();
   sendJsonOk();
 }
 
@@ -1184,6 +1357,10 @@ void setup() {
   loadConfig();
   gCfgLastWriteMs = millis();
 
+  pinMode(PIN_RELAY, OUTPUT);
+  gRelayState = false;
+  relayApplyPin();
+
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
@@ -1220,6 +1397,7 @@ void setup() {
   gServer.on("/api/status", HTTP_GET, handleStatus);
   gServer.on("/api/thresholds", HTTP_GET, handleGetThr);
   gServer.on("/api/thresholds", HTTP_POST, handlePostThr);
+  gServer.on("/api/relay", HTTP_POST, handlePostRelay);
   gServer.on("/api/ap", HTTP_GET, handleGetAp);
   gServer.on("/api/ap", HTTP_POST, handlePostAp);
   gServer.on("/api/sta", HTTP_GET, handleGetSta);
@@ -1250,6 +1428,7 @@ void loop() {
   cfgTick(now);
   bmeTick(now);
   staTick(now);
+  relayTick();
 
   gServer.handleClient();
   if (gDnsStarted) gDns.processNextRequest();
