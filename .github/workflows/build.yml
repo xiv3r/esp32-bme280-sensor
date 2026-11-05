@@ -35,6 +35,7 @@ jobs:
         arduino-cli lib install "Adafruit BME280 Library"
         
         # Compile firmware
+        mv *.ino esp32-bme280-sensor.ino
         arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir firmware .
         
         # Rename
