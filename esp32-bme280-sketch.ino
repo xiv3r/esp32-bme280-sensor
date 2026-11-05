@@ -1269,4 +1269,3 @@ void loop() {
     digitalWrite(PIN_LED, ledState ? HIGH : LOW);
   }
 }
-
