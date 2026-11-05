@@ -1,4 +1,4 @@
-# Simple Instructions — ESP32 BME280 with Relay (GPIO 25)
+<img src="https://github.com/xiv3r/esp32-bme280-sensor/blob/main/esp32-bme280.png">
 
 ## 1. What you need
 
@@ -53,11 +53,11 @@
 ## 4. First-time setup
 
 1. Power the ESP32.
-2. On your phone or laptop, connect to WiFi **`ESP32-Config`** (password **`12345678`**).
+2. On your phone or laptop, connect to WiFi **`ESP32-BME280`** (password **`12345678`**).
 3. A captive-portal page should open. If not, open a browser and go to **`http://192.168.4.1`**.
 4. Log in with:
    - **Username:** `admin`
-   - **Password:** `esp32admin`
+   - **Password:** `12345678`
 5. Go to the **WiFi STA** tab → enter your home WiFi name and password → **Apply STA** → **Reboot**.
 
 Now the ESP32 is on your home network. You can reach it at its new IP address, or reconnect to `ESP32-Config` if you prefer.
