@@ -60,7 +60,7 @@
    - **Password:** `12345678`
 5. Go to the **WiFi STA** tab → enter your home WiFi name and password → **Apply STA** → **Reboot**.
 
-Now the ESP32 is on your home network. You can reach it at its new IP address, or reconnect to `ESP32-Config` if you prefer.
+Now the ESP32 is on your home network. You can reach it at its new IP address, or reconnect to `ESP32-BME280` if you prefer.
 
 ---
 
@@ -112,7 +112,7 @@ Two ways:
 - **System** tab → **Factory Reset** → type `RESET` → confirm.
 - Or hold the **BOOT button** on the ESP32 for **5 seconds**.
 
-After factory reset, the ESP32 returns to `ESP32-Config` / `12345678` and admin `admin` / `esp32admin`.
+After factory reset, the ESP32 returns to `ESP32-BME280` / `12345678` and admin `admin` / `12345678`.
 
 ---
 
@@ -120,14 +120,14 @@ After factory reset, the ESP32 returns to `ESP32-Config` / `12345678` and admin 
 
 | Problem | Fix |
 |---|---|
-| Can't see `ESP32-Config` WiFi | Wait 30 s after power on, or check USB power is enough |
+| Can't see `ESP32-BME280` WiFi | Wait 30 s after power on, or check USB power is enough |
 | Web page doesn't load | Try `http://192.168.4.1` directly. Make sure you're connected to the ESP32's WiFi |
 | Dashboard shows "Sensor not detected" | Check BME280 wiring: SDA→21, SCL→22, VCC→3V3, GND→GND |
 | Relay clicks ON at boot then OFF | Normal — add the 10 kΩ pull-down resistor (step 2) |
 | Relay never turns ON | Check **Relay enabled = Yes**, at least one metric selected, and the invert setting matches your module |
 | Relay ON when value looks OK | You have the invert setting wrong — try the opposite |
 | Relay flickering at threshold | Increase the gap between min and max thresholds slightly |
-| Forgot admin password | Factory reset (step 8), then log in with default `admin` / `esp32admin` |
+| Forgot admin password | Factory reset (step 8), then log in with default `admin` / `12345678` |
 
 ---
 
