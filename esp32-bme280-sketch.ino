@@ -24,7 +24,6 @@
 #define CFG_KEY_A     "cfgA"
 #define CFG_KEY_B     "cfgB"
 #define CFG_KEY_SEQ   "seq"
-#define CFG_KEY_AUTH  "authPass"
 #define BME_INTERVAL_MS     2000
 #define BTN_DEBOUNCE_MS       50
 #define FACTORY_HOLD_MS     5000
@@ -93,7 +92,6 @@ static WebServer  gServer(80);
 static DNSServer  gDns;
 static bool       gDnsStarted        = false;
 static char       gJsonBuf[JSON_BUF_SZ];
-static char       gAuthPass[33] = "12345678";
 static uint16_t crc16(const uint8_t* data, size_t len) {
   uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < len; i++) {
@@ -700,12 +698,6 @@ td{padding:6px 4px;border-bottom:1px solid #334155;word-break:break-all}
 <tr><td>Reset reason</td><td id="sRst">-</td></tr>
 </table>
 </div>
-<div class="card"><h2>Change Admin Password</h2>
-<div class="status" style="opacity:.75;margin-bottom:8px">Login username: <b>admin</b> (fixed)</div>
-<div class="row"><label>New password</label><input id="newAuth" type="password" maxlength="32"></div>
-<button class="act" id="btnAuth">Change Password</button>
-<span class="status" id="authMsg"></span>
-</div>
 <div class="card"><h2>Actions</h2>
 <div class="row">
 <button class="act" id="btnReboot">Reboot</button>
@@ -734,7 +726,7 @@ function idle(){
   while(busyTimers.length){clearTimeout(busyTimers.shift());}
   inflight=0;
 }
-function api(path,opts){return fetch(path,opts).then(function(r){if(r.status===401){var e=new Error('auth');e.auth=true;throw e;}return r.json();});}
+function api(path,opts){return fetch(path,opts).then(function(r){return r.json();});}
 function showBanner(){rebootNeeded=true;$('rebootBanner').classList.add('show');}
 function overlay(msg,color){
   var btns=document.querySelectorAll('button');
@@ -825,10 +817,7 @@ function refreshDash(){
     $('nHost').textContent=d.hostname;
   }).catch(function(e){
     failCount++;
-    if(e&&e.auth){
-      dimMetrics(true);
-      $('sensorStatus').innerHTML='<span class="er">Session expired — reload page</span>';
-    } else if(failCount>=3){
+    if(failCount>=3){
       dimMetrics(true);
       $('sensorStatus').innerHTML='<span class="er">Connection lost — values stale</span>';
     }
@@ -976,30 +965,9 @@ function loadSys(){
     $('sHeapMin').textContent=d.heapMin+' bytes';
     $('sRst').textContent=d.rst;
   }).catch(function(e){
-    if(e&&e.auth){
-      $('sUp').textContent='session expired';
-      $('sHeap').textContent='—';
-      $('sHeapMin').textContent='—';
-      $('sRst').textContent='—';
-    } else {
-      $('sUp').textContent='connection lost';
-    }
+    $('sUp').textContent='connection lost';
   });
 }
-var authBusy=false;
-$('btnAuth').onclick=function(){
-  if(authBusy){return;}
-  var p=$('newAuth').value;
-  if(p.length===0){$('authMsg').innerHTML='<span class="wn">Enter a new password (8-32 chars)</span>';return;}
-  if(p.length<8){$('authMsg').innerHTML='<span class="er">Min 8 chars</span>';return;}
-  if(p.length>32){$('authMsg').innerHTML='<span class="er">Max 32 chars</span>';return;}
-  $('authMsg').textContent='';
-  authBusy=true;
-  api('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pass:p})}).then(function(d){
-    if(d.ok){$('authMsg').innerHTML='<span class="ok">Changed. Reload page to log in.</span>';$('newAuth').value='';}
-    else{$('authMsg').innerHTML='<span class="er">Failed</span>';}
-  }).catch(function(){$('authMsg').innerHTML='<span class="er">Network error</span>';}).then(function(){authBusy=false;});
-};
 $('btnReboot').onclick=function(){if(confirm('Reboot?'))doReboot();};
 $('btnFactory').onclick=function(){
   var a=prompt('Type RESET to erase ALL settings and reboot:');
@@ -1021,11 +989,7 @@ document.addEventListener('DOMContentLoaded',function(){
 </body></html>
 )HTML";
 
-static bool checkAuth() {
-  if (gServer.authenticate("admin", gAuthPass)) return true;
-  gServer.requestAuthentication();
-  return false;
-}
+static bool checkAuth() { return true; }
 
 static void sendHtml() {
   gServer.sendHeader("Cache-Control", "no-store");
@@ -1432,30 +1396,6 @@ static void handleFactory() {
   if (gFactoryAtMs == 0) gFactoryAtMs = 1;
 }
 
-static void handleAuth() {
-  if (!checkAuth()) return;
-  String body = gServer.arg("plain");
-  String pass;
-  if (!jsonGetStr(body, "pass", pass) || pass.length() < 8 || pass.length() > 32) {
-    sendJsonErr("bad pass"); return;
-  }
-  char newPass[33];
-  strncpy(newPass, pass.c_str(), sizeof(newPass) - 1);
-  newPass[sizeof(newPass) - 1] = 0;
-  if (!gPrefs.begin(CFG_NS, false)) {
-    sendJsonErr("nvs open failed");
-    return;
-  }
-  size_t written = gPrefs.putString(CFG_KEY_AUTH, newPass);
-  if (written != strlen(newPass)) {
-    sendJsonErr("nvs write failed");
-    return;
-  }
-  strncpy(gAuthPass, newPass, sizeof(gAuthPass) - 1);
-  gAuthPass[sizeof(gAuthPass) - 1] = 0;
-  sendJsonOk();
-}
-
 static void handleCaptive() {
   IPAddress ap = WiFi.softAPIP();
   if (ap == IPAddress(0, 0, 0, 0)) ap = IPAddress(192, 168, 4, 1);
@@ -1511,13 +1451,7 @@ void setup() {
   bmeInit();
   gBmeLastRead = millis();
   if (gPrefs.begin(CFG_NS, false)) {
-    String ap = gPrefs.getString(CFG_KEY_AUTH, "");
-    if (ap.length() >= 8) {
-      strncpy(gAuthPass, ap.c_str(), sizeof(gAuthPass) - 1);
-      gAuthPass[32] = 0;
-    } else {
-      gPrefs.putString(CFG_KEY_AUTH, gAuthPass);
-    }
+    if (gPrefs.isKey("authPass")) gPrefs.remove("authPass");
   }
   gServer.on("/", HTTP_GET, sendHtml);
   gServer.on("/api/status", HTTP_GET, handleStatus);
@@ -1531,7 +1465,6 @@ void setup() {
   gServer.on("/api/sys", HTTP_GET, handleSys);
   gServer.on("/api/reboot", HTTP_POST, handleReboot);
   gServer.on("/api/factory", HTTP_POST, handleFactory);
-  gServer.on("/api/auth", HTTP_POST, handleAuth);
   static const char* const kProbePaths[] = {
     "/generate_204",
     "/gen_204",
