@@ -69,7 +69,7 @@ jobs:
         echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
     - name: Upload files to existing release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       with:
         tag_name: ${{ steps.get_tag.outputs.tag_name }}
         make_latest: true
