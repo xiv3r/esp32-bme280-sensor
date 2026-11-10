@@ -55,7 +55,7 @@ struct PersistConfig {
   uint32_t magic;
 };
 
-static const uint32_t CFG_MAGIC = 0xBME280CF;
+static const uint32_t CFG_MAGIC = 0xB3E280CF;
 static bool nvsOpened = false;
 
 PersistConfig cfg;
@@ -694,5 +694,3 @@ void loop() {
     }
   }
 }
-
-
