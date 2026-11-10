@@ -34,8 +34,10 @@ jobs:
         arduino-cli core install esp8266:esp8266
         
         # Install libraries
+        arduino-cli lib install "Adafruit BME280 Library"
+        arduino-cli lib install "Adafruit Unified Sensor"
         arduino-cli lib install "ArduinoJson"
-        arduino-cli lib install "Adafruit_BME280"
+        arduino-cli lib install "Preferences"
         
         # Compile firmware
         cd ESP8266
