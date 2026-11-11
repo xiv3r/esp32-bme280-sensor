@@ -24,8 +24,6 @@ struct Config {
 };
 
 Config cfg;
-bool configDirty = false;
-uint32_t lastConfigWrite = 0;
 
 static inline void relayWrite(bool on) {
 #if RELAY_ACTIVE_LOW
@@ -41,7 +39,6 @@ const char* AP_PASS = "12345678";
 #define EEPROM_SIZE 128
 #define ADDR_CONFIG 4
 #define EEPROM_MAGIC 0xB5C0u
-#define CONFIG_WRITE_INTERVAL 60000UL
 #define READ_INTERVAL 2000UL
 #define DNS_PORT 53
 
@@ -53,6 +50,7 @@ DNSServer dnsServer;
 
 int64_t lastTemp = 0, lastHum = 0, lastPres = 0;
 uint32_t lastRead = 0;
+bool hasValidReading = false;
 
 uint32_t buttonDownTime = 0;
 bool buttonDown = false;
@@ -106,12 +104,7 @@ bool saveConfig() {
   EEPROM.put(ADDR_CONFIG, cfg);
   uint32_t crc = cfgCrc(cfg);
   EEPROM.put(ADDR_CONFIG + sizeof(Config), crc);
-  if (EEPROM.commit()) {
-    configDirty = false;
-    lastConfigWrite = millis();
-    return true;
-  }
-  return false;
+  return EEPROM.commit();
 }
 
 void loadConfig() {
@@ -214,9 +207,9 @@ function fetchStatus(){
     if(x.status!==200)return;
     try{
       var d=JSON.parse(x.responseText);
-      $('temp').textContent=fnum(d.t,2)+' C';
-      $('hum').textContent=fnum(d.h,2)+' %';
-      $('pres').textContent=fnum(d.p,2)+' hPa';
+      $('temp').textContent=fnum(d.t/100,2)+' C';
+      $('hum').textContent=fnum(d.h/100,2)+' %';
+      $('pres').textContent=fnum(d.p/100,2)+' hPa';
       var rs=$('relayState');rs.textContent=d.r?'ON':'OFF';rs.className='badge '+(d.r?'on':'off');
       $('uptime').textContent=fmtUptime(d.u);
       $('heap').textContent=(d.fh/1024).toFixed(1)+' KB';
@@ -292,14 +285,11 @@ void handleCaptive() {
 
 void handleStatus() {
   char buf[240];
-  int64_t t = lastTemp, h = lastHum, p = lastPres;
   int relay = (digitalRead(RELAY_PIN) == (RELAY_ACTIVE_LOW ? LOW : HIGH)) ? 1 : 0;
   uint64_t up = uptimeMsCache / 1000ULL;
   snprintf_P(buf, sizeof(buf),
-    PSTR("{\"t\":%ld.%02ld,\"h\":%ld.%02ld,\"p\":%ld.%02ld,\"r\":%d,\"u\":%llu,\"fh\":%u,\"bme\":%d}"),
-    (long)(t/100), (long)llabs(t%100),
-    (long)(h/100), (long)llabs(h%100),
-    (long)(p/100), (long)llabs(p%100),
+    PSTR("{\"t\":%lld,\"h\":%lld,\"p\":%lld,\"r\":%d,\"u\":%llu,\"fh\":%u,\"bme\":%d}"),
+    (long long)lastTemp, (long long)lastHum, (long long)lastPres,
     relay, (unsigned long long)up, (unsigned)ESP.getFreeHeap(), bmeOK?1:0);
   server.send(200, "application/json", buf);
 }
@@ -352,15 +342,22 @@ void handlePostConfig() {
   if (parseJsonInt64(body, "hL", v)) { n.humLow = v; ok = true; }
   if (parseJsonInt64(body, "pH", v)) { n.presHigh = v; ok = true; }
   if (parseJsonInt64(body, "pL", v)) { n.presLow = v; ok = true; }
-  if (parseJsonInt64(body, "m", v) && v >= 0 && v <= 2) { n.relayMode = (uint8_t)v; ok = true; }
+  if (parseJsonInt64(body, "m", v)) {
+    if (v < 0 || v > 2) { server.send(400, "application/json", "{\"e\":\"bad mode\"}"); return; }
+    n.relayMode = (uint8_t)v; ok = true;
+  }
   if (n.tempHigh < n.tempLow) n.tempHigh = n.tempLow;
   if (n.humHigh < n.humLow) n.humHigh = n.humLow;
   if (n.presHigh < n.presLow) n.presHigh = n.presLow;
   if (!ok) { server.send(400, "application/json", "{\"e\":\"bad\"}"); return; }
   cfg = n;
-  saveConfig();
+  bool persisted = saveConfig();
   applyRelay();
-  server.send(200, "application/json", "{\"ok\":1}");
+  if (persisted) {
+    server.send(200, "application/json", "{\"ok\":1}");
+  } else {
+    server.send(500, "application/json", "{\"ok\":0,\"e\":\"eeprom\"}");
+  }
 }
 
 void handleReset() {
@@ -436,12 +433,14 @@ void readSensors() {
   lastTemp = (int64_t)llround((double)t * 100.0);
   lastHum  = (int64_t)llround((double)h * 100.0);
   lastPres = (int64_t)llround((double)p);
+  hasValidReading = true;
 }
 
 void applyRelay() {
   bool on;
   if (cfg.relayMode == 0) on = false;
   else if (cfg.relayMode == 2) on = true;
+  else if (!hasValidReading) on = false;
   else {
     on = (lastTemp >= cfg.tempHigh) || (lastTemp <= cfg.tempLow)
       || (lastHum >= cfg.humHigh)   || (lastHum <= cfg.humLow)
@@ -490,9 +489,6 @@ void loop() {
     lastRead = now;
     readSensors();
     applyRelay();
-  }
-  if (configDirty && timeReached(now, lastConfigWrite, CONFIG_WRITE_INTERVAL)) {
-    saveConfig();
   }
   yield();
 }
