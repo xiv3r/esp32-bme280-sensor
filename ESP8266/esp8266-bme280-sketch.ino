@@ -1,696 +1,540 @@
-/*
- * ESP8266 BME280 Dashboard
- * AP: ESP8266_BME280 / 12345678
- * I2C: SDA=GPIO5(D1) SCL=GPIO4(D2)
- * Relay: GPIO12 (D6)
- * Boot reset: GPIO0 hold 5s
- */
-
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
 #include <DNSServer.h>
 #include <Wire.h>
 #include <Adafruit_BME280.h>
-#include <Preferences.h>
-#include <ArduinoJson.h>
+#include <EEPROM.h>
 
-#define AP_SSID_DEFAULT   "ESP8266_BME280"
-#define AP_PASS_DEFAULT   "12345678"
-#define AP_CHANNEL        6
-#define AP_HIDDEN         0
-#define AP_MAX_CONN       4
+// ===== Pin definitions =====
+#define PIN_SDA       4    
+#define PIN_SCL       5   
+#define PIN_RELAY     13
+#define PIN_BOOT      0
 
-#define I2C_SDA_PIN       5
-#define I2C_SCL_PIN       4
-#define RELAY_PIN         12
-#define RELAY_ACTIVE_LOW  true
+// ===== AP credentials =====
+static const char AP_SSID[] PROGMEM = "ESP8266_BME280";
+static const char AP_PASS[] PROGMEM = "12345678";
 
-#define BOOT_BTN_PIN      0
-#define FACTORY_HOLD_MS   5000UL
+// ===== NVS layout =====
+#define EEPROM_SIZE          32
+#define ADDR_MAGIC           0
+#define ADDR_TEMP_TH         2
+#define ADDR_HUM_TH          4
+#define ADDR_RELAY_EN        6
+#define ADDR_RELAY_STATE     7
+#define ADDR_CHECKSUM        8
+#define MAGIC_VALUE          0xB5
 
-#define STATUS_LED_PIN    2
-#define STATUS_LED_ACTIVE_LOW true
+// ===== Threshold limits =====
+static const int16_t  TEMP_TH_MIN = -400;
+static const int16_t  TEMP_TH_MAX = 850;
+static const uint16_t HUM_TH_MIN  = 0;
+static const uint16_t HUM_TH_MAX  = 1000;
 
-#define SENSOR_PERIOD_MS  2000UL
-#define CONTROL_PERIOD_MS 500UL
-#define SENSOR_STALE_MS   15000UL
-#define NVS_SAVE_DEBOUNCE 60000UL
-#define MDNS_UPDATE_MS    50UL
+static const int16_t  TEMP_HYST   = 3;
+static const uint16_t HUM_HYST    = 10;
 
-#define DNS_PORT 53
-
-enum RelayMode : uint8_t { MODE_AUTO = 0, MODE_MANUAL_ON = 1, MODE_MANUAL_OFF = 2 };
-
-struct PersistConfig {
-  float   tempMin;
-  float   tempMax;
-  float   humMin;
-  float   humMax;
-  float   pressMin;
-  float   pressMax;
-  uint8_t relayMode;
-  bool    relayInvert;
-  bool    relayEnabled;
-  uint32_t magic;
-};
-
-static const uint32_t CFG_MAGIC = 0xB3E280CF;
-static bool nvsOpened = false;
-
-PersistConfig cfg;
-Preferences prefs;
-
-Adafruit_BME280 bme;
-bool bmeOk       = false;
-bool i2cStarted  = false;
-bool mdnsStarted = false;
-bool dnsStarted  = false;
-float curTemp = NAN, curHum = NAN, curPress = NAN;
-uint32_t sensorErrCount  = 0;
-uint32_t lastSensorOkMs  = 0;
-uint32_t lastSensorTryMs = 0;
-uint8_t  sensorErrStreak = 0;
-bool     everReadSensor  = false;
-bool relayState    = false;
-bool relayPhysical = false;
 ESP8266WebServer server(80);
-DNSServer dnsServer;
-uint32_t lastControlMs = 0;
-uint32_t lastNvsSaveMs = 0;
-uint32_t lastMdnsMs    = 0;
-bool nvsDirty = false;
-uint32_t bootPressStartMs      = 0;
-bool     bootPressed           = false;
-bool     factoryResetArmed     = false;
-bool     pendingRestart        = false;
-uint32_t pendingRestartAt      = 0;
-bool     pendingFactoryReset   = false;
-uint32_t pendingFactoryResetAt = 0;
-inline bool timeReached(uint32_t now, uint32_t start, uint32_t interval) {
-  return (uint32_t)(now - start) >= interval;
+DNSServer        dnsServer;
+Adafruit_BME280  bme;
+
+struct Settings {
+  int16_t  tempTh;
+  uint16_t humTh;
+  uint8_t  relayEn;
+  uint8_t  relayState;
+} cfg;
+
+bool     bmeOk        = false;
+bool     buttonHeld   = false;
+bool     buttonUsed   = false;
+uint32_t tSample      = 0;
+uint32_t tRelay       = 0;
+uint32_t tButton      = 0;
+uint32_t tDns         = 0;
+uint32_t tBmeRetry    = 0;
+uint32_t tApCheck     = 0;
+
+float sTemp = NAN, sHum = NAN, sPress = NAN;
+
+// ===== helpers =====
+static int16_t clampI16(int32_t v, int16_t lo, int16_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return (int16_t)v;
 }
-inline bool timeAtOrAfter(uint32_t now, uint32_t target) {
-  return (int32_t)(now - target) >= 0;
-}
-inline bool isFiniteF(float v) { return !isnan(v) && !isinf(v); }
-inline void ledWrite(bool on) {
-#if STATUS_LED_ACTIVE_LOW
-  digitalWrite(STATUS_LED_PIN, on ? LOW : HIGH);
-#else
-  digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
-#endif
+static uint16_t clampU16(int32_t v, uint16_t lo, uint16_t hi) {
+  if (v < (int32_t)lo) return lo;
+  if (v > (int32_t)hi) return hi;
+  return (uint16_t)v;
 }
 
-void scheduleRestart(uint32_t delayMs = 250) {
-  pendingRestart   = true;
-  pendingRestartAt = millis() + delayMs;
+static bool isNumeric(const String &s) {
+  if (s.length() == 0 || s.length() > 10) return false;
+  bool dot = false;
+  bool hasDigit = false;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '-' && i == 0) continue;
+    if (c == '.' && !dot) { dot = true; continue; }
+    if (c < '0' || c > '9') return false;
+    hasDigit = true;
+  }
+  return hasDigit;
 }
 
-void scheduleFactoryReset(uint32_t delayMs = 800) {
-  pendingFactoryReset   = true;
-  pendingFactoryResetAt = millis() + delayMs;
-  factoryResetArmed     = true;
+static uint8_t calcChecksum() {
+  uint8_t cs = MAGIC_VALUE;
+  cs ^= (uint8_t)(cfg.tempTh & 0xFF);
+  cs ^= (uint8_t)((cfg.tempTh >> 8) & 0xFF);
+  cs ^= (uint8_t)(cfg.humTh & 0xFF);
+  cs ^= (uint8_t)((cfg.humTh >> 8) & 0xFF);
+  cs ^= cfg.relayEn;
+  cs ^= cfg.relayState;
+  return cs;
 }
 
-void configDefaults(PersistConfig& c) {
-  c.tempMin      = 20.0f;
-  c.tempMax      = 30.0f;
-  c.humMin       = 30.0f;
-  c.humMax       = 70.0f;
-  c.pressMin     = 950.0f;
-  c.pressMax     = 1050.0f;
-  c.relayMode    = MODE_AUTO;
-  c.relayInvert  = RELAY_ACTIVE_LOW;
-  c.relayEnabled = true;
-  c.magic        = CFG_MAGIC;
-}
-bool validateConfig(const PersistConfig& c) {
-  if (c.magic != CFG_MAGIC) return false;
-  if (!isFiniteF(c.tempMin)  || !isFiniteF(c.tempMax)  || !(c.tempMin  < c.tempMax))  return false;
-  if (!isFiniteF(c.humMin)   || !isFiniteF(c.humMax)   || !(c.humMin   < c.humMax))   return false;
-  if (!isFiniteF(c.pressMin) || !isFiniteF(c.pressMax) || !(c.pressMin < c.pressMax)) return false;
-  if (c.tempMin  < -40.0f || c.tempMax  > 85.0f)   return false;
-  if (c.humMin   <   0.0f || c.humMax   > 100.0f)  return false;
-  if (c.pressMin < 300.0f || c.pressMax > 1100.0f) return false;
-  if (c.relayMode > MODE_MANUAL_OFF)               return false;
+static bool saveSettings();   
+
+static bool loadSettings() {
+  if (EEPROM.read(ADDR_MAGIC) != MAGIC_VALUE) return false;
+
+  int16_t  tt = (int16_t)(EEPROM.read(ADDR_TEMP_TH) | (EEPROM.read(ADDR_TEMP_TH + 1) << 8));
+  uint16_t ht = (uint16_t)(EEPROM.read(ADDR_HUM_TH)  | (EEPROM.read(ADDR_HUM_TH + 1)  << 8));
+  uint8_t  re = EEPROM.read(ADDR_RELAY_EN);
+  uint8_t  rs = EEPROM.read(ADDR_RELAY_STATE);
+
+  cfg.tempTh     = tt;
+  cfg.humTh      = ht;
+  cfg.relayEn    = re;
+  cfg.relayState = rs;
+  bool checksumOk = (EEPROM.read(ADDR_CHECKSUM) == calcChecksum());
+  if (!checksumOk) return false;
+
+  int16_t  clampedT = clampI16(tt, TEMP_TH_MIN, TEMP_TH_MAX);
+  uint16_t clampedH = clampU16(ht, HUM_TH_MIN,  HUM_TH_MAX);
+  uint8_t  fixedE   = (re == 0 || re == 1) ? re : 0;
+  uint8_t  fixedS   = (rs == 0 || rs == 1) ? rs : 0;
+
+  bool changed = (clampedT != tt) || (clampedH != ht) || (fixedE != re) || (fixedS != rs);
+
+  cfg.tempTh     = clampedT;
+  cfg.humTh      = clampedH;
+  cfg.relayEn    = fixedE;
+  cfg.relayState = fixedS;
+
+  if (changed) saveSettings();
+
   return true;
 }
-bool saveConfigNow() {
-  if (!prefs.begin("bme280cfg", false)) {
-    nvsOpened = false;
-    return false;
-  }
-  nvsOpened = true;
-  size_t written = prefs.putBytes("cfg", &cfg, sizeof(cfg));
-  prefs.end();
-  nvsOpened = false;
-  if (written == sizeof(cfg)) {
-    nvsDirty      = false;
-    lastNvsSaveMs = millis();
-    return true;
+
+static bool saveSettings() {
+  EEPROM.write(ADDR_MAGIC, MAGIC_VALUE);
+  EEPROM.write(ADDR_TEMP_TH,     (uint8_t)(cfg.tempTh & 0xFF));
+  EEPROM.write(ADDR_TEMP_TH + 1, (uint8_t)((cfg.tempTh >> 8) & 0xFF));
+  EEPROM.write(ADDR_HUM_TH,      (uint8_t)(cfg.humTh & 0xFF));
+  EEPROM.write(ADDR_HUM_TH + 1,  (uint8_t)((cfg.humTh >> 8) & 0xFF));
+  EEPROM.write(ADDR_RELAY_EN,    cfg.relayEn);
+  EEPROM.write(ADDR_RELAY_STATE, cfg.relayState);
+  EEPROM.write(ADDR_CHECKSUM,    calcChecksum());
+  for (int i = 0; i < 3; i++) {
+    if (EEPROM.commit()) return true;
   }
   return false;
 }
 
-void loadConfig() {
-  configDefaults(cfg);
-  bool needPersist = true;
-  if (prefs.begin("bme280cfg", true)) {
-    size_t n = prefs.getBytesLength("cfg");
-    if (n == sizeof(PersistConfig)) {
-      PersistConfig tmp;
-      if (prefs.getBytes("cfg", &tmp, sizeof(tmp)) == sizeof(tmp) && validateConfig(tmp)) {
-        cfg = tmp;
-        needPersist = false;
-      }
-    }
-    prefs.end();
-  }
-  if (needPersist) saveConfigNow();
+static void applyRelayState() {
+  digitalWrite(PIN_RELAY, cfg.relayState ? HIGH : LOW);
 }
 
-void markDirty() { nvsDirty = true; }
-
-void factoryResetNow() {
-  factoryResetArmed = true;
-  if (mdnsStarted) { MDNS.end(); mdnsStarted = false; }
-  if (dnsStarted)  { dnsServer.stop(); dnsStarted = false; }
-  server.stop();
-  WiFi.softAPdisconnect(true);
-
-  if (prefs.begin("bme280cfg", false)) {
-    prefs.clear();
-    prefs.end();
-  }
-  nvsOpened = false;
-
-  ESP.restart();
+static void defaults() {
+  cfg.tempTh     = 300;
+  cfg.humTh      = 700;
+  cfg.relayEn    = 1;
+  cfg.relayState = 0;
 }
 
-void applyRelayPhysical(bool on) {
-  relayPhysical = on;
-  bool level = cfg.relayInvert ? !on : on;
-  digitalWrite(RELAY_PIN, level ? HIGH : LOW);
+static void factoryReset() {
+  defaults();
+  saveSettings();
+  applyRelayState();
 }
 
-void setRelay(bool on) {
-  if (relayPhysical == on) { relayState = on; return; }
-  relayState = on;
-  applyRelayPhysical(on);
-}
+// ===== HTML =====
+static const char HTML_HEAD[] PROGMEM =
+  "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+  "<title>ESP8266 BME280</title><style>"
+  "body{font-family:Arial;margin:0;background:#f2f4f7;color:#222}"
+  "header{background:#204060;color:#fff;padding:12px 16px;font-size:18px}"
+  ".wrap{max-width:900px;margin:0 auto;padding:12px}"
+  ".card{background:#fff;border-radius:8px;padding:16px;margin:12px 0;box-shadow:0 1px 3px rgba(0,0,0,.1)}"
+  ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}"
+  ".val{font-size:24px;font-weight:bold;color:#204060}"
+  ".lbl{font-size:12px;color:#666;text-transform:uppercase}"
+  "input[type=number]{width:100%;padding:8px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px}"
+  "button{padding:10px 16px;border:0;border-radius:4px;background:#204060;color:#fff;font-size:14px;cursor:pointer;margin-top:8px}"
+  "button.alt{background:#666}button.danger{background:#b33}"
+  "table{width:100%;border-collapse:collapse}td{padding:6px 0;border-bottom:1px solid #eee}"
+  "a{color:#204060;text-decoration:none;margin-right:12px}"
+  "</style></head><body>";
 
-void initSensor() {
-  if (!i2cStarted) {
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setClock(100000);
-    i2cStarted = true;
-  }
-  if (bme.begin(0x76, &Wire) || bme.begin(0x77, &Wire)) {
-    bme.setSampling(
-      Adafruit_BME280::MODE_FORCED,
-      Adafruit_BME280::SAMPLING_X1,
-      Adafruit_BME280::SAMPLING_X1,
-      Adafruit_BME280::SAMPLING_X1,
-      Adafruit_BME280::FILTER_OFF,
-      Adafruit_BME280::STANDBY_MS_1000
-    );
-    bmeOk = true;
-  } else {
-    bmeOk = false;
-  }
-}
-bool readSensor() {
-  if (!bmeOk) return false;
-  if (!bme.takeForcedMeasurement()) return false;
-  float t = bme.readTemperature();
-  float h = bme.readHumidity();
-  float p = bme.readPressure() / 100.0f;
-  if (!isFiniteF(t) || !isFiniteF(h) || !isFiniteF(p)) return false;
-  if (t < -40.0f || t > 85.0f)   return false;
-  if (h < 0.0f   || h > 100.0f)  return false;
-  if (p < 300.0f || p > 1100.0f) return false;
-  curTemp  = t;
-  curHum   = h;
-  curPress = p;
-  lastSensorOkMs = millis();
-  everReadSensor = true;
-  return true;
-}
-bool sensorFresh(uint32_t now) {
-  return everReadSensor && timeReached(now, lastSensorOkMs, SENSOR_STALE_MS);
-}
+static const char HTML_TAIL[] PROGMEM = "</div></body></html>";
 
-void applyControl() {
-  if (cfg.relayMode == MODE_MANUAL_ON)  { setRelay(true);  return; }
-  if (cfg.relayMode == MODE_MANUAL_OFF) { setRelay(false); return; }
-  if (!cfg.relayEnabled) { setRelay(false); return; }
-  if (!sensorFresh(millis()) || !isFiniteF(curTemp) || !isFiniteF(curHum) || !isFiniteF(curPress)) {
-    setRelay(false);
-    return;
-  }
-
-  bool anyAboveMax =
-      (curTemp  > cfg.tempMax ) ||
-      (curHum   > cfg.humMax  ) ||
-      (curPress > cfg.pressMax);
-
-  bool anyBelowMin =
-      (curTemp  < cfg.tempMin ) ||
-      (curHum   < cfg.humMin  ) ||
-      (curPress < cfg.pressMin);
-
-  if (anyAboveMax)      setRelay(true);
-  else if (anyBelowMin) setRelay(false);
-}
-
-void controlLoopTick() {
-  uint32_t now = millis();
-  if (!timeReached(now, lastControlMs, CONTROL_PERIOD_MS)) return;
-  lastControlMs = now;
-  applyControl();
-}
-
-static const char PAGE_INDEX[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BME280 Dashboard</title>
-<style>
-*{box-sizing:border-box}body{font-family:system-ui,Arial;margin:0;background:#111;color:#eee}
-.wrap{max-width:900px;margin:0 auto;padding:16px}h1{font-size:20px;margin:8px 0 16px}
-.card{background:#1c1c1c;border-radius:10px;padding:14px;margin-bottom:12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.val{font-size:26px;font-weight:600}.lbl{font-size:12px;color:#9aa;text-transform:uppercase;letter-spacing:1px}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
-input{background:#222;color:#eee;border:1px solid #333;border-radius:6px;padding:6px;width:90px}
-button{background:#2b7de9;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer}
-button.warn{background:#c33}button.ok{background:#2a9d3a}
-.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px}
-.badge.on{background:#2a9d3a}.badge.off{background:#555}
-a{color:#6cb4ff}small{color:#888}
-</style></head><body><div class="wrap"><h1>BME280 Dashboard</h1>
-<div class="card"><div class="grid">
-<div><div class="lbl">Temperature</div><div class="val"><span id="t">--</span> &deg;C</div></div>
-<div><div class="lbl">Humidity</div><div class="val"><span id="h">--</span> %</div></div>
-<div><div class="lbl">Pressure</div><div class="val"><span id="p">--</span> hPa</div></div>
-<div><div class="lbl">Relay</div><div class="val"><span id="rs" class="badge off">--</span></div></div>
-</div></div>
-<div class="card"><div class="lbl">Relay control</div>
-<div class="row"><button onclick="setMode(0)">Auto</button>
-<button onclick="setMode(1)">Force ON</button>
-<button onclick="setMode(2)">Force OFF</button>
-<small>Mode: <span id="mode">--</span></small></div></div>
-<div class="card"><div class="lbl">Thresholds</div>
-<div class="row">Temp min<input id="tmin"> max<input id="tmax">&deg;C</div>
-<div class="row">Hum min<input id="hmin"> max<input id="hmax">%</div>
-<div class="row">Press min<input id="pmin"> max<input id="pmax">hPa</div>
-<div class="row"><button class="ok" onclick="saveThr()">Save thresholds</button>
-<small>Stored in NVS (debounced)</small></div></div>
-<div class="card"><div class="lbl">System</div>
-<div class="row"><small>Uptime: <span id="up">--</span>s &middot; Heap: <span id="hp">--</span> &middot; Sensor: <span id="sen">--</span></small></div>
-<div class="row"><a href="/wifi">WiFi Settings</a> &middot; <a href="/reset" onclick="return confirm('Factory reset?')">Factory Reset</a></div></div>
-</div>
-<script>
-var thrLoaded=false;
-function fmt(x,d){return (x===null||x===undefined||isNaN(Number(x)))?'--':Number(x).toFixed(d)}
-async function poll(){
- try{
-  var r=await fetch('/api/status',{cache:'no-store'}); if(!r.ok) throw 0;
-  var j=await r.json();
-  document.getElementById('t').textContent=fmt(j.t,2);
-  document.getElementById('h').textContent=fmt(j.h,2);
-  document.getElementById('p').textContent=fmt(j.p,2);
-  var rs=document.getElementById('rs');
-  rs.textContent=j.relay?'ON':'OFF'; rs.className='badge '+(j.relay?'on':'off');
-  document.getElementById('mode').textContent=['Auto','Force ON','Force OFF'][j.mode]||'?';
-  document.getElementById('up').textContent=j.up;
-  document.getElementById('hp').textContent=j.heap;
-  document.getElementById('sen').textContent=j.bme?(j.fresh?'OK':'stale'):'missing';
-  if(!thrLoaded && j.tmin!==undefined && j.tmin!==null){
-   document.getElementById('tmin').value=Number(j.tmin).toFixed(1);
-   document.getElementById('tmax').value=Number(j.tmax).toFixed(1);
-   document.getElementById('hmin').value=Number(j.hmin).toFixed(1);
-   document.getElementById('hmax').value=Number(j.hmax).toFixed(1);
-   document.getElementById('pmin').value=Number(j.pmin).toFixed(1);
-   document.getElementById('pmax').value=Number(j.pmax).toFixed(1);
-   thrLoaded=true;
-  }
- }catch(e){}
-}
-async function setMode(m){try{await fetch('/api/mode?m='+m,{method:'POST'});}catch(e){}await poll();}
-async function saveThr(){
- var b={tmin:Number(document.getElementById('tmin').value),
-        tmax:Number(document.getElementById('tmax').value),
-        hmin:Number(document.getElementById('hmin').value),
-        hmax:Number(document.getElementById('hmax').value),
-        pmin:Number(document.getElementById('pmin').value),
-        pmax:Number(document.getElementById('pmax').value)};
- try{
-  var r=await fetch('/api/thresholds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
-  var j=await r.json();alert(j.ok?'Saved':'Error: '+(j.err||'unknown'));
- }catch(e){alert('Network error');}
-}
-setInterval(poll,2000); poll();
-</script></body></html>)HTML";
-
-static const char PAGE_WIFI[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WiFi Settings</title>
-<style>body{font-family:system-ui,Arial;background:#111;color:#eee;margin:0;padding:16px}
-.wrap{max-width:600px;margin:0 auto}.card{background:#1c1c1c;padding:14px;border-radius:10px;margin-bottom:12px}
-input{width:100%;background:#222;color:#eee;border:1px solid #333;border-radius:6px;padding:8px;margin:4px 0;box-sizing:border-box}
-button{background:#2b7de9;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer}
-a{color:#6cb4ff}small{color:#888}</style></head><body><div class="wrap">
-<h1>WiFi AP Settings</h1>
-<div class="card"><div><b>Current SSID:</b> <span id="cs">--</span></div>
-<div><b>Connected stations:</b> <span id="st">--</span></div>
-<div><b>IP:</b> <span id="ip">--</span></div></div>
-<div class="card"><div>SSID</div><input id="ssid" maxlength="31">
-<div>Password (8-63 chars)</div><input id="pass" maxlength="63" type="text">
-<small>Changing WiFi reboots the device.</small><br><br>
-<button onclick="saveW()">Save &amp; Reboot</button></div>
-<div class="card"><a href="/">Back to Dashboard</a></div></div>
-<script>
-async function load(){
- try{
-  var r=await fetch('/api/wifi',{cache:'no-store'}); var j=await r.json();
-  document.getElementById('cs').textContent=j.ssid;
-  document.getElementById('st').textContent=j.sta;
-  document.getElementById('ip').textContent=j.ip;
-  document.getElementById('ssid').value=j.ssid;
- }catch(e){}
-}
-async function saveW(){
- var s=document.getElementById('ssid').value.trim();
- var p=document.getElementById('pass').value;
- if(s.length<1||s.length>31){alert('SSID 1-31 chars');return}
- if(p.length<8||p.length>63){alert('Password 8-63 chars');return}
- try{
-  var r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:s,pass:p})});
-  var j=await r.json();
-  alert(j.ok?'Saved, rebooting...':'Error');
- }catch(e){alert('Network error');}
-}
-load();
-</script></body></html>)HTML";
-
-static const char PAGE_RESET[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
-<meta charset="utf-8"><title>Factory Reset</title></head>
-<body style="font-family:Arial;background:#111;color:#eee;text-align:center;padding:40px">
-<h2>Factory reset triggered</h2><p>Rebooting &mdash; reconnect to <b>ESP8266_BME280</b></p>
-</body></html>)HTML";
-
-void sendNoCache(const char* ct, const String& body, int code = 200) {
-  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-  server.send(code, ct, body);
-}
-
-void handleRoot() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "text/html", PAGE_INDEX);
-}
-void handleWifiPage() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "text/html", PAGE_WIFI);
-}
-void handleResetPage() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "text/html", PAGE_RESET);
-  nvsDirty = false;
-  scheduleFactoryReset(800);
-}
-
-void handleStatus() {
-  StaticJsonDocument<768> d;
-  if (isFiniteF(curTemp))  d["t"] = curTemp;  else d["t"] = nullptr;
-  if (isFiniteF(curHum))   d["h"] = curHum;   else d["h"] = nullptr;
-  if (isFiniteF(curPress)) d["p"] = curPress; else d["p"] = nullptr;
-  d["relay"] = relayState;
-  d["mode"]  = cfg.relayMode;
-  d["tmin"]  = cfg.tempMin;  d["tmax"] = cfg.tempMax;
-  d["hmin"]  = cfg.humMin;   d["hmax"] = cfg.humMax;
-  d["pmin"]  = cfg.pressMin; d["pmax"] = cfg.pressMax;
-  d["up"]    = millis() / 1000UL;
-  d["heap"]  = ESP.getFreeHeap();
-  d["bme"]   = bmeOk;
-  d["fresh"] = sensorFresh(millis());
-  d["serr"]  = sensorErrCount;
-  d["nvs"]   = nvsOpened;
+static void sendPage(const String &title, const String &body) {
   String out;
-  out.reserve(640);
-  serializeJson(d, out);
-  sendNoCache("application/json", out);
+  out.reserve(3800);
+  out += FPSTR(HTML_HEAD);
+  out += "<header>ESP8266 BME280 &middot; ";
+  out += title;
+  out += "</header><div class='wrap'>";
+  out += "<div class='card'><a href='/'>Dashboard</a><a href='/config'>Configuration</a><a href='/wifi'>Wi-Fi</a></div>";
+  out += body;
+  out += FPSTR(HTML_TAIL);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html; charset=utf-8", out);
 }
 
-void handleThresholds() {
-  if (!server.hasArg("plain")) {
-    sendNoCache("application/json", F("{\"ok\":false,\"err\":\"no body\"}"), 400);
-    return;
-  }
-  StaticJsonDocument<256> d;
-  if (deserializeJson(d, server.arg("plain"))) {
-    sendNoCache("application/json", F("{\"ok\":false,\"err\":\"json\"}"), 400);
-    return;
-  }
-  PersistConfig next = cfg;
-  if (d.containsKey("tmin")) next.tempMin  = d["tmin"].as<float>();
-  if (d.containsKey("tmax")) next.tempMax  = d["tmax"].as<float>();
-  if (d.containsKey("hmin")) next.humMin   = d["hmin"].as<float>();
-  if (d.containsKey("hmax")) next.humMax   = d["hmax"].as<float>();
-  if (d.containsKey("pmin")) next.pressMin = d["pmin"].as<float>();
-  if (d.containsKey("pmax")) next.pressMax = d["pmax"].as<float>();
-  next.magic = CFG_MAGIC;
-  if (!validateConfig(next)) {
-    sendNoCache("application/json", F("{\"ok\":false,\"err\":\"range\"}"), 400);
-    return;
-  }
-  cfg = next;
-  markDirty();
-  applyControl();
-  sendNoCache("application/json", F("{\"ok\":true}"));
+static String fmt(float v, int digits) {
+  if (isnan(v) || isinf(v)) return String("--");
+  return String(v, digits);
 }
 
-void handleMode() {
-  if (!server.hasArg("m")) {
-    sendNoCache("application/json", F("{\"ok\":false}"), 400);
-    return;
-  }
-  const String& arg = server.arg("m");
-  bool numeric = arg.length() > 0 && arg.length() <= 2;
-  for (size_t i = 0; numeric && i < arg.length(); i++) {
-    if (arg[i] < '0' || arg[i] > '9') numeric = false;
-  }
-  if (!numeric) {
-    sendNoCache("application/json", F("{\"ok\":false}"), 400);
-    return;
-  }
-  long m = arg.toInt();
-  if (m < 0 || m > 2) {
-    sendNoCache("application/json", F("{\"ok\":false}"), 400);
-    return;
-  }
-  cfg.relayMode = (uint8_t)m;
-  markDirty();
-  applyControl();
-  sendNoCache("application/json", F("{\"ok\":true}"));
+static String buildDashboard() {
+  String b;
+  b.reserve(2000);
+  b += "<div class='card'><h3>Live Readings</h3><div class='grid'>";
+  b += "<div><div class='lbl'>Temperature</div><div class='val'>"; b += fmt(sTemp, 2); b += " &deg;C</div></div>";
+  b += "<div><div class='lbl'>Humidity</div><div class='val'>";    b += fmt(sHum, 2);  b += " %</div></div>";
+  b += "<div><div class='lbl'>Pressure</div><div class='val'>";    b += fmt(sPress, 2);b += " hPa</div></div>";
+  b += "<div><div class='lbl'>Relay</div><div class='val'>";       b += (cfg.relayState ? "ON" : "OFF"); b += "</div></div>";
+  b += "</div></div>";
+
+  b += "<div class='card'><h3>Relay Control</h3>";
+  b += "<div>Auto threshold mode: <b>"; b += (cfg.relayEn ? "ON" : "OFF"); b += "</b></div>";
+  b += "<div style='margin-top:6px'>";
+  b += (cfg.relayEn ? "Auto state" : "Manual state");
+  b += ": <b>"; b += (cfg.relayState ? "ON" : "OFF"); b += "</b></div>";
+  b += "<form method='POST' action='/relay'>"
+       "<button name='state' value='on' type='submit'>Relay ON</button> "
+       "<button name='state' value='off' type='submit' class='alt'>Relay OFF</button> "
+       "<button name='state' value='toggle' type='submit' class='alt'>Toggle</button>"
+       "</form>";
+  b += "<form method='POST' action='/auto'>"
+       "<button name='mode' value='on' type='submit'>Auto ON</button> "
+       "<button name='mode' value='off' type='submit' class='alt'>Auto OFF</button>"
+       "</form></div>";
+
+  b += "<div class='card'><h3>System</h3><table>";
+  b += "<tr><td>Uptime (s)</td><td>"; b += String(millis() / 1000UL); b += "</td></tr>";
+  b += "<tr><td>Free heap</td><td>";  b += String(ESP.getFreeHeap()); b += "</td></tr>";
+  b += "<tr><td>Sensor</td><td>";     b += (bmeOk ? "OK" : "FAULT"); b += "</td></tr>";
+  b += "<tr><td>IP</td><td>";         b += WiFi.softAPIP().toString(); b += "</td></tr>";
+  b += "<tr><td>Clients</td><td>";    b += String(WiFi.softAPgetStationNum()); b += "</td></tr>";
+  b += "</table></div>";
+  return b;
 }
 
-void handleWifiGet() {
-  StaticJsonDocument<256> d;
-  d["ssid"] = WiFi.softAPSSID();
-  d["sta"]  = WiFi.softAPgetStationNum();
-  d["ip"]   = WiFi.softAPIP().toString();
-  String out; out.reserve(256);
-  serializeJson(d, out);
-  sendNoCache("application/json", out);
+static String buildConfig() {
+  String b;
+  b.reserve(2100);
+  if (server.hasArg("err")) {
+    b += "<div class='card' style='background:#fdd;color:#900'>"
+         "Invalid input &mdash; value out of range or not numeric. "
+         "Settings were not saved.</div>";
+  }
+  b += "<div class='card'><h3>Thresholds</h3>";
+  b += "<form method='POST' action='/config'>";
+  b += "<input type='hidden' name='cfgform' value='1'>";
+  b += "<div style='margin-bottom:10px'><div class='lbl'>Temperature threshold (&deg;C, -40.0 to 85.0)</div>";
+  b += "<input type='number' step='0.1' min='-40' max='85' name='temp' value='"; b += String(cfg.tempTh / 10.0f, 1); b += "'></div>";
+  b += "<div style='margin-bottom:10px'><div class='lbl'>Humidity threshold (%, 0.0 to 100.0)</div>";
+  b += "<input type='number' step='0.1' min='0' max='100' name='hum' value='"; b += String(cfg.humTh / 10.0f, 1); b += "'></div>";
+  b += "<div style='margin-bottom:10px'><div class='lbl'>Auto relay threshold mode</div>";
+  b += "<input type='checkbox' name='auto' value='1'"; b += (cfg.relayEn ? " checked" : ""); b += "></div>";
+  b += "<button type='submit'>Save Settings</button></form></div>";
+
+  b += "<div class='card'><h3>Factory Reset</h3>";
+  b += "<p>Restores all settings to defaults. Wi-Fi credentials are not affected.</p>";
+  b += "<form method='POST' action='/reset' onsubmit=\"return confirm('Factory reset?')\">";
+  b += "<button type='submit' class='danger'>Factory Reset</button></form></div>";
+  return b;
 }
 
-void handleWifiPost() {
-  if (!server.hasArg("plain")) {
-    sendNoCache("application/json", F("{\"ok\":false}"), 400); return;
-  }
-  StaticJsonDocument<256> d;
-  if (deserializeJson(d, server.arg("plain"))) {
-    sendNoCache("application/json", F("{\"ok\":false}"), 400); return;
-  }
-  const char* sPtr = d["ssid"] | (const char*)nullptr;
-  const char* pPtr = d["pass"] | (const char*)nullptr;
-  if (!sPtr || !pPtr) {
-    sendNoCache("application/json", F("{\"ok\":false}"), 400); return;
-  }
-  String s(sPtr), p(pPtr);
-  if (s.length() < 1 || s.length() > 31 || p.length() < 8 || p.length() > 63) {
-    sendNoCache("application/json", F("{\"ok\":false}"), 400); return;
-  }
-  if (prefs.begin("bme280cfg", false)) {
-    prefs.putString("ssid", s);
-    prefs.putString("pass", p);
-    prefs.end();
-  }
-  sendNoCache("application/json", F("{\"ok\":true}"));
-  scheduleRestart(400);
+static String buildWifi() {
+  String b;
+  b.reserve(900);
+  b += "<div class='card'><h3>Access Point</h3><table>";
+  b += "<tr><td>SSID</td><td>";     b += FPSTR(AP_SSID); b += "</td></tr>";
+  b += "<tr><td>Password</td><td>"; b += FPSTR(AP_PASS); b += "</td></tr>";
+  b += "<tr><td>Status</td><td>";   b += ((WiFi.getMode() & WIFI_AP) ? "Active" : "Inactive"); b += "</td></tr>";
+  b += "<tr><td>IP</td><td>";       b += WiFi.softAPIP().toString(); b += "</td></tr>";
+  b += "<tr><td>Clients</td><td>";  b += String(WiFi.softAPgetStationNum()); b += "</td></tr>";
+  b += "</table></div>";
+  b += "<div class='card'><h3>Captive Portal</h3><p>All HTTP requests are redirected to the dashboard. "
+       "Any domain resolves here and every unknown path is captured.</p></div>";
+  return b;
 }
 
-void redirectToPortal() {
-  String url = String("http://") + WiFi.softAPIP().toString() + "/";
-  server.sendHeader("Location", url, true);
-  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+// ===== handlers =====
+static void handleRoot()     { sendPage("Dashboard",     buildDashboard()); }
+static void handleConfigGet(){ sendPage("Configuration", buildConfig());   }
+static void handleWifiGet()  { sendPage("Wi-Fi",         buildWifi());      }
+
+static void handleConfigPost() {
+  bool bad = false;
+  int16_t  newTemp = cfg.tempTh;
+  uint16_t newHum  = cfg.humTh;
+  uint8_t  newEn   = cfg.relayEn;
+
+  if (server.hasArg("temp")) {
+    String v = server.arg("temp");
+    if (isNumeric(v)) {
+      float f = v.toFloat();
+      if (f < (TEMP_TH_MIN / 10.0f) || f > (TEMP_TH_MAX / 10.0f)) {
+        bad = true;
+      } else {
+        int32_t t = (int32_t)(f * 10.0f);
+        newTemp = clampI16(t, TEMP_TH_MIN, TEMP_TH_MAX);
+      }
+    } else {
+      bad = true;
+    }
+  }
+
+  if (server.hasArg("hum")) {
+    String v = server.arg("hum");
+    if (isNumeric(v)) {
+      float f = v.toFloat();
+      if (f < (HUM_TH_MIN / 10.0f) || f > (HUM_TH_MAX / 10.0f)) {
+        bad = true;
+      } else {
+        int32_t h = (int32_t)(f * 10.0f);
+        newHum = clampU16(h, HUM_TH_MIN, HUM_TH_MAX);
+      }
+    } else {
+      bad = true;
+    }
+  }
+
+  if (server.hasArg("cfgform")) {
+    newEn = server.hasArg("auto") ? 1 : 0;
+  }
+
+  if (!bad) {
+    cfg.tempTh  = newTemp;
+    cfg.humTh   = newHum;
+    cfg.relayEn = newEn;
+    saveSettings();
+  }
+
+  server.sendHeader("Location", bad ? "/config?err=1" : "/config", true);
   server.send(302, "text/plain", "");
 }
-void handleCaptiveOk()   { redirectToPortal(); }
-void handleGenerate204() { server.send(204, "text/plain", ""); }
-void handleFavicon()     { server.send(204, "text/plain", ""); }
-void handleNotFound() {
-  if (server.uri().startsWith("/api/")) {
-    sendNoCache("application/json", F("{\"ok\":false,\"err\":\"not found\"}"), 404);
-    return;
+
+static void handleRelayPost() {
+  if (server.hasArg("state")) {
+    String s = server.arg("state");
+    bool valid = true;
+    if      (s == "on")     cfg.relayState = 1;
+    else if (s == "off")    cfg.relayState = 0;
+    else if (s == "toggle") cfg.relayState = cfg.relayState ? 0 : 1;
+    else valid = false;
+    if (valid) {
+      cfg.relayEn = 0;
+      saveSettings();
+      applyRelayState();
+    }
   }
-  redirectToPortal();
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
 }
 
-void startAP() {
-  String ssid = AP_SSID_DEFAULT;
-  String pass = AP_PASS_DEFAULT;
-  if (prefs.begin("bme280cfg", true)) {
-    String s = prefs.getString("ssid", "");
-    String p = prefs.getString("pass", "");
-    prefs.end();
-    bool customValid = (s.length() >= 1 && s.length() <= 31 &&
-                        p.length() >= 8 && p.length() <= 63);
-    if (customValid) { ssid = s; pass = p; }
+static void handleAutoPost() {
+  if (server.hasArg("mode")) {
+    cfg.relayEn = (server.arg("mode") == "on") ? 1 : 0;
+    saveSettings();
   }
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+static void handleResetPost() {
+  factoryReset();
+  server.sendHeader("Location", "/config", true);
+  server.send(302, "text/plain", "");
+}
+
+static void handleNotFound() {
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+// ===== BME280 helpers =====
+static bool initBme() {
+  static const uint8_t addrs[2] = {0x76, 0x77};
+  for (int a = 0; a < 2; a++) {
+    if (bme.begin(addrs[a], &Wire)) {
+      bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                      Adafruit_BME280::SAMPLING_X2,
+                      Adafruit_BME280::SAMPLING_X16,
+                      Adafruit_BME280::SAMPLING_X1,
+                      Adafruit_BME280::FILTER_X16,
+                      Adafruit_BME280::STANDBY_MS_1000);
+      bme.takeForcedMeasurement();
+      float t = bme.readTemperature();
+      float h = bme.readHumidity();
+      float p = bme.readPressure();
+      if (!isnan(t) && !isnan(h) && !isnan(p) && !isinf(t) && !isinf(h) && !isinf(p)) {
+        return true;
+      }
+      continue;
+    }
+  }
+  return false;
+}
+
+// ===== setup =====
+void setup() {
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, LOW);
+  pinMode(PIN_BOOT, INPUT_PULLUP);
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000);
+  bmeOk = initBme();
+
+  EEPROM.begin(EEPROM_SIZE);
+  if (!loadSettings()) {
+    defaults();
+    saveSettings();
+  }
+
+  if (!cfg.relayEn) {
+    applyRelayState();
+  } else {
+    digitalWrite(PIN_RELAY, LOW);
+  }
+
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
-  WiFi.softAPdisconnect(true);
-  delay(50);
-  bool ok = WiFi.softAP(ssid.c_str(), pass.c_str(), AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
-  if (!ok && (ssid != AP_SSID_DEFAULT || pass != AP_PASS_DEFAULT)) 
-    WiFi.softAP(AP_SSID_DEFAULT, AP_PASS_DEFAULT, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
-    if (prefs.begin("bme280cfg", false)) {
-      prefs.remove("ssid");
-      prefs.remove("pass");
-      prefs.end();
-    }
-  }
-  uint32_t start = millis();
-  while (WiFi.softAPIP() == IPAddress(0, 0, 0, 0) &&
-         !timeReached(millis(), start, 500)) {
-    delay(10);
-  }
-}
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(FPSTR(AP_SSID), FPSTR(AP_PASS));
 
-void startDns() {
-  if (dnsStarted) return;
-  if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) return;
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-  dnsStarted = true;
-}
+  dnsServer.start(53, "*", WiFi.softAPIP());
 
-void setup() {
-  digitalWrite(STATUS_LED_PIN, HIGH);
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  ledWrite(false);
-  loadConfig();
-  digitalWrite(RELAY_PIN, cfg.relayInvert ? HIGH : LOW);
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
-  relayState = false;
-  applyRelayPhysical(false);
-  initSensor();
-  startAP();
-  startDns();
-  server.on("/",                    HTTP_GET,  handleRoot);
-  server.on("/wifi",                HTTP_GET,  handleWifiPage);
-  server.on("/reset",               HTTP_GET,  handleResetPage);
-  server.on("/api/status",          HTTP_GET,  handleStatus);
-  server.on("/api/thresholds",      HTTP_POST, handleThresholds);
-  server.on("/api/mode",            HTTP_POST, handleMode);
-  server.on("/api/wifi",            HTTP_GET,  handleWifiGet);
-  server.on("/api/wifi",            HTTP_POST, handleWifiPost);
-  server.on("/generate_204",        HTTP_GET,  handleGenerate204);
-  server.on("/gen_204",             HTTP_GET,  handleGenerate204);
-  server.on("/hotspot-detect.html", HTTP_GET,  handleCaptiveOk);
-  server.on("/connecttest.txt",     HTTP_GET,  handleCaptiveOk);
-  server.on("/redirect",            HTTP_GET,  handleCaptiveOk);
-  server.on("/canonical.html",      HTTP_GET,  handleCaptiveOk);
-  server.on("/ncsi.txt",            HTTP_GET,  handleCaptiveOk);
-  server.on("/favicon.ico",         HTTP_GET,  handleFavicon);
+  server.on("/",        HTTP_GET,  handleRoot);
+  server.on("/config",  HTTP_GET,  handleConfigGet);
+  server.on("/config",  HTTP_POST, handleConfigPost);
+  server.on("/wifi",    HTTP_GET,  handleWifiGet);
+  server.on("/relay",   HTTP_POST, handleRelayPost);
+  server.on("/auto",    HTTP_POST, handleAutoPost);
+  server.on("/reset",   HTTP_POST, handleResetPost);
+
+  server.on("/generate_204",        HTTP_GET, handleNotFound);
+  server.on("/gen_204",             HTTP_GET, handleNotFound);
+  server.on("/hotspot-detect.html", HTTP_GET, handleNotFound);
+  server.on("/connecttest.txt",     HTTP_GET, handleNotFound);
+  server.on("/ncsi.txt",            HTTP_GET, handleNotFound);
+  server.on("/fwlink",              HTTP_GET, handleNotFound);
+  server.on("/redirect",            HTTP_GET, handleNotFound);
+
   server.onNotFound(handleNotFound);
   server.begin();
-  if (MDNS.begin("bme280")) {
-    MDNS.addService("http", "tcp", 80);
-    mdnsStarted = true;
-  }
-  lastSensorOkMs  = 0;
-  lastSensorTryMs = millis();
-  lastControlMs   = millis();
-  lastNvsSaveMs   = millis();
-  lastMdnsMs      = millis();
+
+  uint32_t now = millis();
+  tSample   = now;
+  tRelay    = now;
+  tButton   = now;
+  tDns      = now;
+  tBmeRetry = now;
+  tApCheck  = now;
 }
 
+// ===== loop =====
 void loop() {
-  uint32_t now = millis();
-  if (pendingFactoryReset) {
-    server.handleClient();
-    if (timeAtOrAfter(now, pendingFactoryResetAt)) {
-      pendingFactoryReset = false;
-      factoryResetNow();
-    }
-    return;
-  }
-  if (!dnsStarted) startDns();
   server.handleClient();
-  if (dnsStarted) dnsServer.processNextRequest();
-  if (mdnsStarted && timeReached(now, lastMdnsMs, MDNS_UPDATE_MS)) {
-    lastMdnsMs = now;
-    MDNS.update();
+  uint32_t now = millis();
+
+  if ((uint32_t)(now - tDns) >= 5) {
+    tDns = now;
+    dnsServer.processNextRequest();
   }
-  if (pendingRestart && timeAtOrAfter(now, pendingRestartAt)) {
-    pendingRestart = false;
-    ESP.restart();
-  }
-  if (timeReached(now, lastSensorTryMs, SENSOR_PERIOD_MS)) {
-    lastSensorTryMs = now;
-    if (readSensor()) {
-      sensorErrStreak = 0;
-    } else {
-      sensorErrCount++;
-      if (sensorErrStreak < 255) sensorErrStreak++;
-      if (sensorErrStreak >= 5) {
-        sensorErrStreak = 0;
-        initSensor();
+
+  if ((uint32_t)(now - tSample) >= 1000) {
+    tSample = now;
+    if (bmeOk) {
+      bme.takeForcedMeasurement();
+      float t = bme.readTemperature();
+      float h = bme.readHumidity();
+      float p = bme.readPressure() / 100.0f;
+      if (isnan(t) || isnan(h) || isnan(p) || isinf(t) || isinf(h) || isinf(p)) {
+        bmeOk = false;
+        tBmeRetry = now;
+      } else {
+        sTemp = t; sHum = h; sPress = p;
       }
     }
   }
-  controlLoopTick();
-  if (nvsDirty && timeReached(now, lastNvsSaveMs, NVS_SAVE_DEBOUNCE)) {
-    saveConfigNow();
+
+  if (!bmeOk && (uint32_t)(now - tBmeRetry) >= 5000) {
+    tBmeRetry = now;
+    Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.setClock(100000);
+    bmeOk = initBme();
   }
-  if (!factoryResetArmed) {
-    bool pressed = (digitalRead(BOOT_BTN_PIN) == LOW);
-    if (pressed) {
-      if (!bootPressed) { bootPressed = true; bootPressStartMs = now; }
-      else if (timeReached(now, bootPressStartMs, FACTORY_HOLD_MS)) {
-        ledWrite(true);
-        scheduleFactoryReset(0);
+
+  // Relay tick
+  if ((uint32_t)(now - tRelay) >= 250) {
+    tRelay = now;
+    if (cfg.relayEn && !isnan(sTemp) && !isnan(sHum)) {
+      int32_t t10 = (int32_t)(sTemp * 10.0f);
+      int32_t h10 = (int32_t)(sHum  * 10.0f);
+      bool want;
+      if (cfg.relayState == 0) {
+        want = (t10 >= (int32_t)cfg.tempTh) || (h10 >= (int32_t)cfg.humTh);
+      } else {
+        int32_t tOff = (int32_t)cfg.tempTh - (int32_t)TEMP_HYST;
+        int32_t hOff = (int32_t)cfg.humTh  - (int32_t)HUM_HYST;
+        if (tOff < (int32_t)TEMP_TH_MIN) tOff = (int32_t)TEMP_TH_MIN;
+        if (hOff < (int32_t)HUM_TH_MIN)  hOff = (int32_t)HUM_TH_MIN;
+        want = (t10 > tOff) || (h10 > hOff);
       }
-    } else {
-      bootPressed = false;
+      uint8_t target = want ? 1 : 0;
+      if (target != cfg.relayState) {
+        cfg.relayState = target;
+      }
+    }
+    applyRelayState();
+  }
+
+  if ((uint32_t)(now - tApCheck) >= 30000) {
+    tApCheck = now;
+    IPAddress ip = WiFi.softAPIP();
+    if (!(WiFi.getMode() & WIFI_AP) || ip == IPAddress(0, 0, 0, 0)) {
+      WiFi.mode(WIFI_AP);
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAP(FPSTR(AP_SSID), FPSTR(AP_PASS));
+      dnsServer.stop();
+      dnsServer.start(53, "*", WiFi.softAPIP());
     }
   }
-  if (!factoryResetArmed) {
-    static uint32_t ledBlinkMs = 0;
-    static bool     ledPhase   = false;
-    bool healthy = bmeOk && sensorFresh(now) && isFiniteF(curTemp);
-    if (healthy) {
-      ledWrite(false);
-      ledPhase = false;
-    } else {
-      if (timeReached(now, ledBlinkMs, 500)) {
-        ledBlinkMs = now;
-        ledPhase = !ledPhase;
-        ledWrite(ledPhase);
+
+  // Boot button factory reset (5 s hold, latched)
+  int bootState = digitalRead(PIN_BOOT);
+  if (bootState == LOW) {
+    if (!buttonUsed) {
+      if (!buttonHeld) {
+        buttonHeld = true;
+        tButton = now;
+      } else if ((uint32_t)(now - tButton) >= 5000) {
+        buttonHeld = false;
+        buttonUsed = true;
+        factoryReset();
       }
     }
+  } else {
+    buttonHeld = false;
+    buttonUsed = false;
   }
 }
