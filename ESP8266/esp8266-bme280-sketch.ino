@@ -12,21 +12,6 @@
 #define BOOT_BUTTON_PIN 0
 #define RELAY_ACTIVE_LOW 0
 
-static inline void relayWrite(bool on) {
-#if RELAY_ACTIVE_LOW
-  digitalWrite(RELAY_PIN, on ? LOW : HIGH);
-#else
-  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
-#endif
-}
-
-const char* AP_SSID = "ESP8266_BME280";
-const char* AP_PASS = "12345678";
-
-#define EEPROM_SIZE 128
-#define ADDR_CONFIG 4
-#define EEPROM_MAGIC 0xB5C0u
-
 struct Config {
   uint16_t magic;
   int64_t tempHigh;
@@ -41,18 +26,33 @@ struct Config {
 Config cfg;
 bool configDirty = false;
 uint32_t lastConfigWrite = 0;
-const uint32_t CONFIG_WRITE_INTERVAL = 60000UL;
+
+static inline void relayWrite(bool on) {
+#if RELAY_ACTIVE_LOW
+  digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+#else
+  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+#endif
+}
+
+const char* AP_SSID = "ESP8266_BME280";
+const char* AP_PASS = "12345678";
+
+#define EEPROM_SIZE 128
+#define ADDR_CONFIG 4
+#define EEPROM_MAGIC 0xB5C0u
+#define CONFIG_WRITE_INTERVAL 60000UL
+#define READ_INTERVAL 2000UL
+#define DNS_PORT 53
 
 Adafruit_BME280 bme;
 bool bmeOK = false;
 
 ESP8266WebServer server(80);
 DNSServer dnsServer;
-const byte DNS_PORT = 53;
 
 int64_t lastTemp = 0, lastHum = 0, lastPres = 0;
 uint32_t lastRead = 0;
-const uint32_t READ_INTERVAL = 2000UL;
 
 uint32_t buttonDownTime = 0;
 bool buttonDown = false;
@@ -165,7 +165,7 @@ button.danger:active{background:#b91c1c}
 </style>
 </head>
 <body>
-<h1>🌡️ BME280 Dashboard</h1>
+<h1>BME280 Dashboard</h1>
 <div class="card">
 <h2>Live Readings</h2>
 <div class="row"><span>Temperature</span><span class="val" id="temp">--</span></div>
@@ -176,8 +176,8 @@ button.danger:active{background:#b91c1c}
 <div class="card">
 <h2>Thresholds</h2>
 <div class="grid">
-<div><label>Temp High (°C)</label><input type="number" id="tH" step="0.01"></div>
-<div><label>Temp Low (°C)</label><input type="number" id="tL" step="0.01"></div>
+<div><label>Temp High (C)</label><input type="number" id="tH" step="0.01"></div>
+<div><label>Temp Low (C)</label><input type="number" id="tL" step="0.01"></div>
 <div><label>Hum High (%)</label><input type="number" id="hH" step="0.01"></div>
 <div><label>Hum Low (%)</label><input type="number" id="hL" step="0.01"></div>
 <div><label>Pres High (hPa)</label><input type="number" id="pH" step="0.01"></div>
@@ -214,7 +214,7 @@ function fetchStatus(){
     if(x.status!==200)return;
     try{
       var d=JSON.parse(x.responseText);
-      $('temp').textContent=fnum(d.t,2)+' \u00B0C';
+      $('temp').textContent=fnum(d.t,2)+' C';
       $('hum').textContent=fnum(d.h,2)+' %';
       $('pres').textContent=fnum(d.p,2)+' hPa';
       var rs=$('relayState');rs.textContent=d.r?'ON':'OFF';rs.className='badge '+(d.r?'on':'off');
@@ -316,12 +316,10 @@ void handleGetConfig() {
 }
 
 bool parseJsonInt64(const String& body, const char* key, int64_t& out) {
-  const char* s = body.c_str();
-  size_t slen = body.length();
   char needle[24];
   int n = snprintf(needle, sizeof(needle), "\"%s\":", key);
   if (n <= 0 || n >= (int)sizeof(needle)) return false;
-  const char* p = strstr(s, needle);
+  const char* p = strstr(body.c_str(), needle);
   if (!p) return false;
   p += n;
   while (*p == ' ' || *p == '\t') p++;
@@ -337,7 +335,6 @@ bool parseJsonInt64(const String& body, const char* key, int64_t& out) {
     digits++;
     p++;
   }
-  (void)slen;
   if (!digits) return false;
   out = neg ? -v : v;
   return true;
@@ -361,8 +358,8 @@ void handlePostConfig() {
   if (n.presHigh < n.presLow) n.presHigh = n.presLow;
   if (!ok) { server.send(400, "application/json", "{\"e\":\"bad\"}"); return; }
   cfg = n;
-  saveConfig();          
-  applyRelay();          
+  saveConfig();
+  applyRelay();
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
@@ -481,7 +478,6 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
-
   if (now < msPrev) msOverflow += 0x100000000ULL;
   msPrev = now;
   uptimeMsCache = msOverflow + now;
