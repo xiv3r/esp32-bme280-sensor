@@ -62,6 +62,7 @@ static bool sensorCooldown = false;
 
 static uint64_t s_upAccMs = 0;
 static uint32_t s_upLast = 0;
+static bool pendingRestart = false;
 
 static const char AP_SSID[] PROGMEM = "ESP8266_BME280";
 static const char AP_PASS[] PROGMEM = "12345678";
@@ -280,6 +281,20 @@ static bool loadCfg() {
   return crc8((const uint8_t*)&tmp, offsetof(Settings, crc)) == saved;
 }
 
+static bool clampCfg() {
+  if (cfg.tempLow   < -4000LL  || cfg.tempLow   > 8500LL)   return false;
+  if (cfg.tempHigh  < -4000LL  || cfg.tempHigh  > 8500LL)   return false;
+  if (cfg.humLow    < 0LL      || cfg.humLow    > 10000LL)  return false;
+  if (cfg.humHigh   < 0LL      || cfg.humHigh   > 10000LL)  return false;
+  if (cfg.pressLow  < 30000LL  || cfg.pressLow  > 110000LL) return false;
+  if (cfg.pressHigh < 30000LL  || cfg.pressHigh > 110000LL) return false;
+  if (cfg.tempLow  >= cfg.tempHigh)  return false;
+  if (cfg.humLow   >= cfg.humHigh)   return false;
+  if (cfg.pressLow >= cfg.pressHigh) return false;
+  if (cfg.relayMode > 2)             return false;
+  return true;
+}
+
 static bool saveCfg() {
   cfg.crc = crc8((const uint8_t*)&cfg, offsetof(Settings, crc));
   EEPROM.put(0, cfg);
@@ -431,6 +446,7 @@ static void setupWeb() {
       String v = body.substring(idx, end);
       v.trim();
       if (v.length() == 0) { ok = false; return 0; }
+      if (v == "-" || v == "+") { ok = false; return 0; }
       for (int i = 0; i < (int)v.length(); i++) {
         char c = v[i];
         if (!((c >= '0' && c <= '9') || (i == 0 && c == '-'))) { ok = false; return 0; }
@@ -524,6 +540,11 @@ static void setupWeb() {
       server.send(400, "application/json", F("{\"e\":5}"));
       return;
     }
+    if (ssid.indexOf('"') >= 0 || ssid.indexOf('\\') >= 0 ||
+        pass.indexOf('"') >= 0 || pass.indexOf('\\') >= 0) {
+      server.send(400, "application/json", F("{\"e\":6}"));
+      return;
+    }
     WiFi.mode(WIFI_AP_STA);
     WiFi.persistent(false);
     WiFi.begin(ssid.c_str(), pass.c_str());
@@ -539,7 +560,7 @@ static void setupWeb() {
   server.on("/api/factory", HTTP_POST, []() {
     server.send(200, "application/json", F("{\"ok\":1}"));
     server.client().stop();
-    factoryReset();
+    pendingRestart = true;
   });
 
   server.onNotFound([]() {
@@ -565,7 +586,7 @@ void setup() {
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
 
   EEPROM.begin(EEPROM_SIZE);
-  if (!loadCfg()) {
+  if (!loadCfg() || !clampCfg()) {
     defaults();
     saveCfg();
   }
@@ -582,6 +603,11 @@ void loop() {
   dns.processNextRequest();
   server.handleClient();
   yield();
+
+  if (pendingRestart) {
+    delay(200);
+    factoryReset();
+  }
 
   uint32_t now = millis();
 
