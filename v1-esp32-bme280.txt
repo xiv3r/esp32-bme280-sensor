@@ -1,0 +1,767 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <Preferences.h>
+#include <esp_system.h>
+#include <esp_attr.h>
+#include <esp_task_wdt.h>
+
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define RELAY_PIN 25
+#define BOOT_BUTTON_PIN 0
+#define FACTORY_RESET_HOLD_MS 5000UL
+
+#define DEFAULT_AP_SSID "ESP32_BME280"
+#define DEFAULT_AP_PASS "12345678"
+
+#define NVS_NS_WIFI "wifi_cfg"
+#define NVS_NS_SENSOR "sensor_cfg"
+#define NVS_NS_RELAY "relay_cfg"
+
+#define KEY_WIFI_SSID "ssid"
+#define KEY_WIFI_PASS "pass"
+#define KEY_TEMP_MIN "tmin"
+#define KEY_TEMP_MAX "tmax"
+#define KEY_HUM_MIN "hmin"
+#define KEY_HUM_MAX "hmax"
+#define KEY_PRES_MIN "pmin"
+#define KEY_PRES_MAX "pmax"
+#define KEY_RELAY_MODE "rmode"
+#define KEY_RELAY_STATE "rstate"
+#define KEY_CONFIG_VALID "valid"
+#define KEY_ALT_REF "altref"
+
+#define SENSOR_READ_INTERVAL_MS 2000UL
+#define RELAY_SAVE_DEBOUNCE_MS 5000UL
+#define CONFIG_MAGIC 0xBE280001UL
+
+#define WDT_TIMEOUT_S 30
+
+#define BOOT_RESET_MAGIC 0xB0070000UL
+#define BOOT_RESET_MAX_PER_POWERON 3UL
+
+const char PROGMEM PAGE_DASHBOARD[] = R"rawliteral(
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>BME280 Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;padding:16px;padding-bottom:32px}
+h1{text-align:center;font-size:1.5rem;margin-bottom:16px;color:#00d4ff}
+.card{background:#16213e;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 4px 6px rgba(0,0,0,0.3)}
+.card h2{font-size:1rem;color:#00d4ff;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+.metric{text-align:center;padding:16px;background:#0f3460;border-radius:8px}
+.metric .value{font-size:2rem;font-weight:bold;color:#00d4ff;word-break:break-all}
+.metric .unit{font-size:0.8rem;color:#888}
+.metric .label{font-size:0.75rem;color:#aaa;margin-top:4px;text-transform:uppercase}
+.relay-state{text-align:center;padding:16px;border-radius:8px;font-size:1.2rem;font-weight:bold;transition:background .3s}
+.relay-on{background:#0a5c2e;color:#4ade80}
+.relay-off{background:#5c1a1a;color:#f87171}
+.nav{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.nav a{flex:1;min-width:90px;text-align:center;padding:12px;background:#16213e;color:#00d4ff;text-decoration:none;border-radius:8px;font-size:0.9rem;font-weight:600}
+.nav a:active,.nav a:hover{background:#0f3460}
+.status{text-align:center;font-size:0.8rem;color:#666;margin-top:8px;min-height:1em}
+.bad{color:#f87171}
+@media(max-width:400px){.metric .value{font-size:1.5rem}}
+</style></head><body>
+<h1>BME280 Dashboard</h1>
+<div class="nav"><a href="/">Dashboard</a><a href="/settings">Settings</a><a href="/wifi">WiFi</a></div>
+<div class="card"><h2>Environment</h2><div class="grid">
+<div class="metric"><div class="value" id="temp">--</div><div class="unit">&deg;C</div><div class="label">Temperature</div></div>
+<div class="metric"><div class="value" id="hum">--</div><div class="unit">%</div><div class="label">Humidity</div></div>
+<div class="metric"><div class="value" id="pres">--</div><div class="unit">hPa</div><div class="label">Pressure</div></div>
+<div class="metric"><div class="value" id="alt">--</div><div class="unit">m</div><div class="label">Altitude</div></div>
+</div></div>
+<div class="card"><h2>Relay Status</h2><div id="relay" class="relay-state relay-off">OFF</div></div>
+<div class="card"><h2>System</h2><div class="grid">
+<div class="metric"><div class="value" id="uptime">--</div><div class="unit">s</div><div class="label">Uptime</div></div>
+<div class="metric"><div class="value" id="heap">--</div><div class="unit">bytes</div><div class="label">Free Heap</div></div>
+<div class="metric"><div class="value" id="rssi">--</div><div class="unit">dBm</div><div class="label">RSSI</div></div>
+<div class="metric"><div class="value" id="sen">--</div><div class="unit"></div><div class="label">Sensor</div></div>
+</div></div>
+<div class="status" id="status">Connecting...</div>
+<script>
+(function(){
+var err=0,busy=false,timer=null;
+var eT=document.getElementById('temp'),eH=document.getElementById('hum'),eP=document.getElementById('pres'),eA=document.getElementById('alt');
+var eR=document.getElementById('relay'),eU=document.getElementById('uptime'),eHP=document.getElementById('heap');
+var eS=document.getElementById('rssi'),eN=document.getElementById('sen'),eSt=document.getElementById('status');
+function upd(){
+  if(busy)return;busy=true;
+  var ctrl=('AbortController'in window)?new AbortController():null;
+  var tmo=ctrl?setTimeout(function(){ctrl.abort();},4000):null;
+  var opts={cache:'no-store'};if(ctrl)opts.signal=ctrl.signal;
+  fetch('/api/data',opts).then(function(r){
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(function(d){
+    if(tmo)clearTimeout(tmo);
+    eT.textContent=d.t.toFixed(1);eH.textContent=d.h.toFixed(1);
+    eP.textContent=d.p.toFixed(1);eA.textContent=d.a.toFixed(0);
+    eR.textContent=d.r?'ON':'OFF';
+    eR.className='relay-state '+(d.r?'relay-on':'relay-off');
+    eU.textContent=d.u;eHP.textContent=d.hp;eS.textContent=d.s;
+    eN.textContent=d.v?'OK':'ERR';
+    eN.style.color=d.v?'#4ade80':'#f87171';
+    eSt.textContent='Updated '+new Date().toLocaleTimeString();
+    eSt.className='status';err=0;busy=false;
+  }).catch(function(e){
+    if(tmo)clearTimeout(tmo);
+    err++;eSt.textContent='Connection error ('+err+')';eSt.className='status bad';busy=false;
+  });
+}
+upd();timer=setInterval(upd,2000);
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden){if(timer)clearInterval(timer);timer=null;}
+  else{if(!timer){upd();timer=setInterval(upd,2000);}}
+});
+})();
+</script></body></html>
+)rawliteral";
+
+const char PROGMEM PAGE_SETTINGS[] = R"rawliteral(
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>BME280 Settings</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;padding:16px;padding-bottom:32px}
+h1{text-align:center;font-size:1.5rem;margin-bottom:16px;color:#00d4ff}
+.card{background:#16213e;border-radius:12px;padding:20px;margin-bottom:16px}
+.card h2{font-size:1rem;color:#00d4ff;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
+.nav{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.nav a{flex:1;min-width:90px;text-align:center;padding:12px;background:#16213e;color:#00d4ff;text-decoration:none;border-radius:8px;font-size:0.9rem;font-weight:600}
+.nav a:active,.nav a:hover{background:#0f3460}
+label{display:block;font-size:0.85rem;color:#aaa;margin-bottom:4px;margin-top:12px}
+input,select{width:100%;padding:10px;border-radius:8px;border:1px solid #0f3460;background:#0a0a1a;color:#eee;font-size:1rem}
+input:focus,select:focus{outline:none;border-color:#00d4ff}
+button{width:100%;padding:14px;margin-top:16px;border:none;border-radius:8px;background:#00d4ff;color:#1a1a2e;font-size:1rem;font-weight:bold;cursor:pointer}
+button:active{background:#00a8cc}
+button:disabled{background:#555;cursor:not-allowed}
+.msg{text-align:center;padding:12px;margin-top:12px;border-radius:8px;font-size:0.9rem;display:none}
+.msg.show{display:block}
+.ok{background:#0a5c2e;color:#4ade80}
+.err{background:#5c1a1a;color:#f87171}
+.info{font-size:0.75rem;color:#888;margin-top:8px}
+</style></head><body>
+<h1>Sensor Settings</h1>
+<div class="nav"><a href="/">Dashboard</a><a href="/settings">Settings</a><a href="/wifi">WiFi</a></div>
+<div class="card"><h2>Thresholds &amp; Relay</h2>
+<form id="f" novalidate>
+<label>Temp Min (&deg;C)</label><input type="number" step="0.1" id="tmin" required>
+<label>Temp Max (&deg;C)</label><input type="number" step="0.1" id="tmax" required>
+<label>Humidity Min (%)</label><input type="number" step="0.1" min="0" max="100" id="hmin" required>
+<label>Humidity Max (%)</label><input type="number" step="0.1" min="0" max="100" id="hmax" required>
+<label>Pressure Min (hPa)</label><input type="number" step="0.1" id="pmin" required>
+<label>Pressure Max (hPa)</label><input type="number" step="0.1" id="pmax" required>
+<label>Altitude Reference (hPa)</label><input type="number" step="0.1" id="altref" required>
+<label>Relay Trigger Mode</label>
+<select id="rmode">
+<option value="0">Any value outside range</option>
+<option value="1">Temperature outside range</option>
+<option value="2">Humidity outside range</option>
+<option value="3">Pressure outside range</option>
+<option value="4">All three outside range</option>
+</select>
+<button type="submit" id="bs">Save Settings</button>
+</form>
+<div class="msg" id="msg"></div>
+<div class="info">Relay state is persisted. Config writes are debounced to protect NVS lifespan.</div>
+</div>
+<script>
+(function(){
+var m=document.getElementById('msg'),bs=document.getElementById('bs');
+function show(t,ok){m.textContent=t;m.className='msg show '+(ok?'ok':'err');if(ok)setTimeout(function(){m.className='msg';},4000);}
+function num(id){var v=parseFloat(document.getElementById(id).value);return isFinite(v)?v:NaN;}
+var loaded=false;
+fetch('/api/settings',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+document.getElementById('tmin').value=d.tmin;document.getElementById('tmax').value=d.tmax;
+document.getElementById('hmin').value=d.hmin;document.getElementById('hmax').value=d.hmax;
+document.getElementById('pmin').value=d.pmin;document.getElementById('pmax').value=d.pmax;
+document.getElementById('altref').value=d.altref;document.getElementById('rmode').value=d.rmode;
+loaded=true;
+}).catch(function(){show('Failed to load settings',false);});
+document.getElementById('f').addEventListener('submit',function(e){
+e.preventDefault();
+if(!loaded){show('Settings not loaded yet',false);return;}
+var d={tmin:num('tmin'),tmax:num('tmax'),hmin:num('hmin'),hmax:num('hmax'),
+pmin:num('pmin'),pmax:num('pmax'),altref:num('altref'),
+rmode:parseInt(document.getElementById('rmode').value,10)};
+if(isNaN(d.tmin)||isNaN(d.tmax)||isNaN(d.hmin)||isNaN(d.hmax)||isNaN(d.pmin)||isNaN(d.pmax)||isNaN(d.altref)){show('All fields required',false);return;}
+if(d.tmin>=d.tmax){show('Temp min must be < max',false);return;}
+if(d.hmin>=d.hmax){show('Humidity min must be < max',false);return;}
+if(d.pmin>=d.pmax){show('Pressure min must be < max',false);return;}
+if(d.hmin<0||d.hmax>100){show('Humidity 0-100%',false);return;}
+if(d.altref<300||d.altref>1100){show('Altitude ref 300-1100 hPa',false);return;}
+bs.disabled=true;
+fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d),cache:'no-store'})
+.then(function(r){return r.json();}).then(function(r){
+bs.disabled=false;
+show(r.ok?'Settings saved!':'Error: '+r.err,r.ok);
+}).catch(function(){bs.disabled=false;show('Network error',false);});
+});
+})();
+</script></body></html>
+)rawliteral";
+
+const char PROGMEM PAGE_WIFI[] = R"rawliteral(
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>WiFi Settings</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;padding:16px;padding-bottom:32px}
+h1{text-align:center;font-size:1.5rem;margin-bottom:16px;color:#00d4ff}
+.card{background:#16213e;border-radius:12px;padding:20px;margin-bottom:16px}
+.card h2{font-size:1rem;color:#00d4ff;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
+.nav{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.nav a{flex:1;min-width:90px;text-align:center;padding:12px;background:#16213e;color:#00d4ff;text-decoration:none;border-radius:8px;font-size:0.9rem;font-weight:600}
+.nav a:active,.nav a:hover{background:#0f3460}
+label{display:block;font-size:0.85rem;color:#aaa;margin-bottom:4px;margin-top:12px}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid #0f3460;background:#0a0a1a;color:#eee;font-size:1rem}
+input:focus{outline:none;border-color:#00d4ff}
+button{width:100%;padding:14px;margin-top:16px;border:none;border-radius:8px;background:#00d4ff;color:#1a1a2e;font-size:1rem;font-weight:bold;cursor:pointer}
+button:active{background:#00a8cc}
+button:disabled{background:#555;cursor:not-allowed}
+.msg{text-align:center;padding:12px;margin-top:12px;border-radius:8px;font-size:0.9rem;display:none}
+.msg.show{display:block}
+.ok{background:#0a5c2e;color:#4ade80}
+.err{background:#5c1a1a;color:#f87171}
+.info{font-size:0.75rem;color:#888;margin-top:8px}
+.warn{background:#5c4a1a;color:#fbbf24;padding:12px;border-radius:8px;margin-top:12px;font-size:0.85rem;display:none}
+.warn.show{display:block}
+</style></head><body>
+<h1>WiFi AP Settings</h1>
+<div class="nav"><a href="/">Dashboard</a><a href="/settings">Settings</a><a href="/wifi">WiFi</a></div>
+<div class="card"><h2>Access Point</h2>
+<form id="f" novalidate>
+<label>SSID (1-32 chars)</label><input type="text" id="ssid" maxlength="32" required autocomplete="off">
+<label>Password (8-63 chars, empty = open)</label><input type="text" id="pass" maxlength="63" autocomplete="off">
+<button type="submit" id="bs">Save &amp; Restart AP</button>
+</form>
+<div class="msg" id="msg"></div>
+<div class="warn" id="warn">WiFi settings changed. Device restarting - reconnect to the new SSID and reload this page.</div>
+<div class="info">Device will restart after save. All connected clients will disconnect.</div>
+</div>
+<script>
+(function(){
+var m=document.getElementById('msg'),bs=document.getElementById('bs'),warn=document.getElementById('warn');
+function show(t,ok){m.textContent=t;m.className='msg show '+(ok?'ok':'err');}
+var loaded=false;
+fetch('/api/wifi',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+document.getElementById('ssid').value=d.ssid;document.getElementById('pass').value=d.pass;loaded=true;
+}).catch(function(){show('Failed to load WiFi config',false);});
+document.getElementById('f').addEventListener('submit',function(e){
+e.preventDefault();
+if(!loaded){show('Config not loaded yet',false);return;}
+var s=document.getElementById('ssid').value;
+var p=document.getElementById('pass').value;
+if(s.length<1||s.length>32){show('SSID must be 1-32 chars',false);return;}
+if(p.length>0&&(p.length<8||p.length>63)){show('Password must be 8-63 chars or empty',false);return;}
+if(/[\x00-\x1f\x7f"\\]/.test(s)){show('SSID contains invalid characters',false);return;}
+if(p.length>0&&/[\x00-\x1f\x7f"\\]/.test(p)){show('Password contains invalid characters',false);return;}
+bs.disabled=true;
+fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:s,pass:p}),cache:'no-store'})
+.then(function(r){return r.json();}).then(function(r){
+if(r.ok){show('Saved! Device restarting...',true);warn.className='warn show';}
+else{bs.disabled=false;show('Error: '+r.err,false);}
+}).catch(function(){
+show('Saved (connection lost - device restarting)',true);warn.className='warn show';
+});
+});
+})();
+</script></body></html>
+)rawliteral";
+
+WebServer server(80);
+DNSServer dnsServer;
+Adafruit_BME280 bme;
+Preferences prefs;
+
+struct SensorData {
+  float temperature;
+  float humidity;
+  float pressure;
+  float altitude;
+  bool valid;
+  bool bmeOk;
+  unsigned long lastRead;
+} sensorData;
+
+struct Settings {
+  float tempMin;
+  float tempMax;
+  float humMin;
+  float humMax;
+  float presMin;
+  float presMax;
+  float altRef;
+  uint8_t relayMode;
+} settings;
+
+struct WifiConfig {
+  char ssid[33];
+  char pass[64];
+} wifiConfig;
+
+volatile bool relayState = false;
+bool relayPersistPending = false;
+unsigned long relayPersistDeadline = 0;
+
+unsigned long lastSensorRead = 0;
+unsigned long bootButtonPressStart = 0;
+bool bootButtonPressed = false;
+
+RTC_NOINIT_ATTR uint32_t bootResetMagic;
+RTC_NOINIT_ATTR uint32_t bootResetCount;
+
+void applyDefaults() {
+  strncpy(wifiConfig.ssid, DEFAULT_AP_SSID, 32);
+  wifiConfig.ssid[32] = 0;
+  strncpy(wifiConfig.pass, DEFAULT_AP_PASS, 63);
+  wifiConfig.pass[63] = 0;
+  settings.tempMin = -10.0f;
+  settings.tempMax = 40.0f;
+  settings.humMin = 20.0f;
+  settings.humMax = 80.0f;
+  settings.presMin = 950.0f;
+  settings.presMax = 1050.0f;
+  settings.altRef = 1013.25f;
+  settings.relayMode = 0;
+  relayState = false;
+}
+
+bool settingsValid(const Settings &s) {
+  if (!(s.tempMin < s.tempMax)) return false;
+  if (!(s.humMin < s.humMax)) return false;
+  if (!(s.presMin < s.presMax)) return false;
+  if (s.humMin < 0.0f || s.humMax > 100.0f) return false;
+  if (s.altRef < 300.0f || s.altRef > 1100.0f) return false;
+  if (s.relayMode > 4) return false;
+  if (s.tempMin < -100.0f || s.tempMax > 200.0f) return false;
+  if (s.presMin < 300.0f || s.presMax > 1200.0f) return false;
+  return true;
+}
+
+bool wifiValid() {
+  size_t sl = strlen(wifiConfig.ssid);
+  size_t pl = strlen(wifiConfig.pass);
+  if (sl < 1 || sl > 32) return false;
+  if (pl != 0 && (pl < 8 || pl > 63)) return false;
+  for (size_t i = 0; i < sl; i++) {
+    unsigned char c = (unsigned char)wifiConfig.ssid[i];
+    if (c < 0x20 || c == 0x7f || c == '"' || c == '\\') return false;
+  }
+  for (size_t i = 0; i < pl; i++) {
+    unsigned char c = (unsigned char)wifiConfig.pass[i];
+    if (c < 0x20 || c == 0x7f || c == '"' || c == '\\') return false;
+  }
+  return true;
+}
+
+void nvsLoadWifi() {
+  prefs.begin(NVS_NS_WIFI, true);
+  uint32_t magic = prefs.getUInt(KEY_CONFIG_VALID, 0);
+  if (magic != CONFIG_MAGIC) {
+    prefs.end();
+    strncpy(wifiConfig.ssid, DEFAULT_AP_SSID, 32);
+    wifiConfig.ssid[32] = 0;
+    strncpy(wifiConfig.pass, DEFAULT_AP_PASS, 63);
+    wifiConfig.pass[63] = 0;
+    return;
+  }
+  String s = prefs.getString(KEY_WIFI_SSID, DEFAULT_AP_SSID);
+  String p = prefs.getString(KEY_WIFI_PASS, DEFAULT_AP_PASS);
+  prefs.end();
+  strncpy(wifiConfig.ssid, s.c_str(), 32);
+  wifiConfig.ssid[32] = 0;
+  strncpy(wifiConfig.pass, p.c_str(), 63);
+  wifiConfig.pass[63] = 0;
+  if (!wifiValid()) {
+    strncpy(wifiConfig.ssid, DEFAULT_AP_SSID, 32);
+    wifiConfig.ssid[32] = 0;
+    strncpy(wifiConfig.pass, DEFAULT_AP_PASS, 63);
+    wifiConfig.pass[63] = 0;
+  }
+}
+
+void nvsSaveWifi() {
+  prefs.begin(NVS_NS_WIFI, false);
+  prefs.putString(KEY_WIFI_SSID, wifiConfig.ssid);
+  prefs.putString(KEY_WIFI_PASS, wifiConfig.pass);
+  prefs.putUInt(KEY_CONFIG_VALID, CONFIG_MAGIC);
+  prefs.end();
+}
+
+void nvsLoadSettings() {
+  prefs.begin(NVS_NS_SENSOR, true);
+  uint32_t magic = prefs.getUInt(KEY_CONFIG_VALID, 0);
+  if (magic != CONFIG_MAGIC) {
+    prefs.end();
+    settings.tempMin = -10.0f;
+    settings.tempMax = 40.0f;
+    settings.humMin = 20.0f;
+    settings.humMax = 80.0f;
+    settings.presMin = 950.0f;
+    settings.presMax = 1050.0f;
+    settings.altRef = 1013.25f;
+    settings.relayMode = 0;
+    return;
+  }
+  settings.tempMin = prefs.getFloat(KEY_TEMP_MIN, -10.0f);
+  settings.tempMax = prefs.getFloat(KEY_TEMP_MAX, 40.0f);
+  settings.humMin = prefs.getFloat(KEY_HUM_MIN, 20.0f);
+  settings.humMax = prefs.getFloat(KEY_HUM_MAX, 80.0f);
+  settings.presMin = prefs.getFloat(KEY_PRES_MIN, 950.0f);
+  settings.presMax = prefs.getFloat(KEY_PRES_MAX, 1050.0f);
+  settings.altRef = prefs.getFloat(KEY_ALT_REF, 1013.25f);
+  settings.relayMode = prefs.getUChar(KEY_RELAY_MODE, 0);
+  prefs.end();
+  if (!settingsValid(settings)) {
+    settings.tempMin = -10.0f;
+    settings.tempMax = 40.0f;
+    settings.humMin = 20.0f;
+    settings.humMax = 80.0f;
+    settings.presMin = 950.0f;
+    settings.presMax = 1050.0f;
+    settings.altRef = 1013.25f;
+    settings.relayMode = 0;
+  }
+}
+
+void nvsSaveSettings() {
+  prefs.begin(NVS_NS_SENSOR, false);
+  prefs.putFloat(KEY_TEMP_MIN, settings.tempMin);
+  prefs.putFloat(KEY_TEMP_MAX, settings.tempMax);
+  prefs.putFloat(KEY_HUM_MIN, settings.humMin);
+  prefs.putFloat(KEY_HUM_MAX, settings.humMax);
+  prefs.putFloat(KEY_PRES_MIN, settings.presMin);
+  prefs.putFloat(KEY_PRES_MAX, settings.presMax);
+  prefs.putFloat(KEY_ALT_REF, settings.altRef);
+  prefs.putUChar(KEY_RELAY_MODE, settings.relayMode);
+  prefs.putUInt(KEY_CONFIG_VALID, CONFIG_MAGIC);
+  prefs.end();
+}
+
+void nvsLoadRelayState() {
+  prefs.begin(NVS_NS_RELAY, true);
+  uint32_t magic = prefs.getUInt(KEY_CONFIG_VALID, 0);
+  if (magic != CONFIG_MAGIC) {
+    prefs.end();
+    relayState = false;
+    return;
+  }
+  relayState = prefs.getBool(KEY_RELAY_STATE, false);
+  prefs.end();
+}
+
+void nvsSaveRelayState() {
+  prefs.begin(NVS_NS_RELAY, false);
+  prefs.putBool(KEY_RELAY_STATE, relayState);
+  prefs.putUInt(KEY_CONFIG_VALID, CONFIG_MAGIC);
+  prefs.end();
+}
+
+void nvsFactoryReset() {
+  prefs.begin(NVS_NS_WIFI, false); prefs.clear(); prefs.end();
+  prefs.begin(NVS_NS_SENSOR, false); prefs.clear(); prefs.end();
+  prefs.begin(NVS_NS_RELAY, false); prefs.clear(); prefs.end();
+  applyDefaults();
+  nvsSaveWifi();
+  nvsSaveSettings();
+  nvsSaveRelayState();
+}
+
+void setRelay(bool on) {
+  if (relayState == on) return;
+  relayState = on;
+  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+  relayPersistPending = true;
+  relayPersistDeadline = millis() + RELAY_SAVE_DEBOUNCE_MS;
+}
+
+void evaluateRelay() {
+  if (!sensorData.valid) return;
+  bool tOut = (sensorData.temperature < settings.tempMin || sensorData.temperature > settings.tempMax);
+  bool hOut = (sensorData.humidity < settings.humMin || sensorData.humidity > settings.humMax);
+  bool pOut = (sensorData.pressure < settings.presMin || sensorData.pressure > settings.presMax);
+  bool trigger = false;
+  switch (settings.relayMode) {
+    case 0: trigger = tOut || hOut || pOut; break;
+    case 1: trigger = tOut; break;
+    case 2: trigger = hOut; break;
+    case 3: trigger = pOut; break;
+    case 4: trigger = tOut && hOut && pOut; break;
+    default: trigger = false; break;
+  }
+  setRelay(trigger);
+}
+
+void readSensor() {
+  unsigned long now = millis();
+  if ((unsigned long)(now - lastSensorRead) < SENSOR_READ_INTERVAL_MS) return;
+  lastSensorRead = now;
+  if (!sensorData.bmeOk) return;
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+  float p = bme.readPressure() / 100.0f;
+  if (isnan(t) || isnan(h) || isnan(p) || p < 200.0f || p > 1300.0f || h < 0.0f || h > 100.0f || t < -100.0f || t > 200.0f) {
+    sensorData.valid = false;
+    return;
+  }
+  sensorData.temperature = t;
+  sensorData.humidity = h;
+  sensorData.pressure = p;
+  sensorData.altitude = bme.readAltitude(settings.altRef);
+  sensorData.valid = true;
+  sensorData.lastRead = now;
+  evaluateRelay();
+}
+
+void sendJSONRaw(int code, const char *json) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Connection", "close");
+  server.send(code, "application/json", json);
+}
+
+void sendJSONOk() {
+  sendJSONRaw(200, "{\"ok\":true}");
+}
+
+void sendJSONErr(const char *err) {
+  char buf[128];
+  snprintf(buf, sizeof(buf), "{\"ok\":false,\"err\":\"%s\"}", err);
+  sendJSONRaw(200, buf);
+}
+
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", PAGE_DASHBOARD);
+}
+
+void handleSettingsPage() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", PAGE_SETTINGS);
+}
+
+void handleWifiPage() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", PAGE_WIFI);
+}
+
+void handleApiData() {
+  char buf[384];
+  uint32_t uptime = (uint32_t)(millis() / 1000UL);
+  uint32_t heap = ESP.getFreeHeap();
+  int rssi = WiFi.RSSI();
+  float t = sensorData.valid ? sensorData.temperature : 0.0f;
+  float h = sensorData.valid ? sensorData.humidity : 0.0f;
+  float p = sensorData.valid ? sensorData.pressure : 0.0f;
+  float a = sensorData.valid ? sensorData.altitude : 0.0f;
+  snprintf(buf, sizeof(buf),
+    "{\"t\":%.2f,\"h\":%.2f,\"p\":%.2f,\"a\":%.2f,\"r\":%d,\"u\":%lu,\"hp\":%lu,\"s\":%d,\"v\":%d}",
+    t, h, p, a, relayState ? 1 : 0, (unsigned long)uptime, (unsigned long)heap, rssi,
+    sensorData.valid ? 1 : 0);
+  sendJSONRaw(200, buf);
+}
+
+void handleApiSettingsGet() {
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{\"tmin\":%.2f,\"tmax\":%.2f,\"hmin\":%.2f,\"hmax\":%.2f,\"pmin\":%.2f,\"pmax\":%.2f,\"altref\":%.2f,\"rmode\":%u}",
+    settings.tempMin, settings.tempMax, settings.humMin, settings.humMax,
+    settings.presMin, settings.presMax, settings.altRef, (unsigned)settings.relayMode);
+  sendJSONRaw(200, buf);
+}
+
+void handleApiSettingsPost() {
+  if (!server.hasArg("plain")) { sendJSONErr("no body"); return; }
+  String body = server.arg("plain");
+  if (body.length() > 512) { sendJSONErr("body too large"); return; }
+  float tmin, tmax, hmin, hmax, pmin, pmax, altref;
+  int rmode;
+  int n = sscanf(body.c_str(),
+    "{\"tmin\":%f,\"tmax\":%f,\"hmin\":%f,\"hmax\":%f,\"pmin\":%f,\"pmax\":%f,\"altref\":%f,\"rmode\":%d}",
+    &tmin, &tmax, &hmin, &hmax, &pmin, &pmax, &altref, &rmode);
+  if (n != 8) { sendJSONErr("parse error"); return; }
+  Settings ns;
+  ns.tempMin = tmin; ns.tempMax = tmax;
+  ns.humMin = hmin; ns.humMax = hmax;
+  ns.presMin = pmin; ns.presMax = pmax;
+  ns.altRef = altref; ns.relayMode = (uint8_t)rmode;
+  if (!settingsValid(ns)) { sendJSONErr("invalid values"); return; }
+  settings = ns;
+  nvsSaveSettings();
+  sensorData.altitude = sensorData.bmeOk ? bme.readAltitude(settings.altRef) : 0.0f;
+  evaluateRelay();
+  sendJSONOk();
+}
+
+void handleApiWifiGet() {
+  char buf[160];
+  snprintf(buf, sizeof(buf), "{\"ssid\":\"%s\",\"pass\":\"%s\"}", wifiConfig.ssid, wifiConfig.pass);
+  sendJSONRaw(200, buf);
+}
+
+void handleApiWifiPost() {
+  if (!server.hasArg("plain")) { sendJSONErr("no body"); return; }
+  String body = server.arg("plain");
+  if (body.length() > 256) { sendJSONErr("body too large"); return; }
+  char ssid[64] = {0};
+  char pass[80] = {0};
+  const char *cp = body.c_str();
+  const char *sp = strstr(cp, "\"ssid\":\"");
+  if (!sp) { sendJSONErr("missing ssid"); return; }
+  sp += 8;
+  const char *se = strchr(sp, '"');
+  if (!se) { sendJSONErr("ssid parse"); return; }
+  size_t sl = (size_t)(se - sp);
+  if (sl > 32) { sendJSONErr("ssid too long"); return; }
+  memcpy(ssid, sp, sl); ssid[sl] = 0;
+  const char *pp = strstr(se + 1, "\"pass\":\"");
+  if (pp) {
+    pp += 8;
+    const char *pe = strchr(pp, '"');
+    if (!pe) { sendJSONErr("pass parse"); return; }
+    size_t pl = (size_t)(pe - pp);
+    if (pl > 63) { sendJSONErr("pass too long"); return; }
+    memcpy(pass, pp, pl); pass[pl] = 0;
+  }
+  size_t slen = strlen(ssid);
+  size_t plen = strlen(pass);
+  if (slen < 1 || slen > 32) { sendJSONErr("ssid length"); return; }
+  if (plen != 0 && (plen < 8 || plen > 63)) { sendJSONErr("pass length"); return; }
+  for (size_t i = 0; i < slen; i++) {
+    unsigned char c = (unsigned char)ssid[i];
+    if (c < 0x20 || c == 0x7f || c == '"' || c == '\\') { sendJSONErr("ssid char"); return; }
+  }
+  for (size_t i = 0; i < plen; i++) {
+    unsigned char c = (unsigned char)pass[i];
+    if (c < 0x20 || c == 0x7f || c == '"' || c == '\\') { sendJSONErr("pass char"); return; }
+  }
+  strncpy(wifiConfig.ssid, ssid, 32); wifiConfig.ssid[32] = 0;
+  strncpy(wifiConfig.pass, pass, 63); wifiConfig.pass[63] = 0;
+  nvsSaveWifi();
+  if (relayPersistPending) { nvsSaveRelayState(); relayPersistPending = false; }
+  sendJSONOk();
+  server.client().flush();
+  delay(300);
+  ESP.restart();
+}
+
+void handleApiRelay() {
+  char buf[48];
+  snprintf(buf, sizeof(buf), "{\"state\":%d}", relayState ? 1 : 0);
+  sendJSONRaw(200, buf);
+}
+
+void handleCaptivePortal() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleNotFound() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+void checkBootButton() {
+  if (bootResetMagic != BOOT_RESET_MAGIC) {
+    bootResetMagic = BOOT_RESET_MAGIC;
+    bootResetCount = 0;
+  }
+  int state = digitalRead(BOOT_BUTTON_PIN);
+  unsigned long now = millis();
+  if (state == LOW) {
+    if (!bootButtonPressed) {
+      bootButtonPressed = true;
+      bootButtonPressStart = now;
+    } else if ((unsigned long)(now - bootButtonPressStart) >= FACTORY_RESET_HOLD_MS) {
+      if (bootResetCount >= BOOT_RESET_MAX_PER_POWERON) {
+        bootButtonPressed = false;
+        return;
+      }
+      bootResetCount++;
+      if (relayPersistPending) { nvsSaveRelayState(); relayPersistPending = false; }
+      nvsFactoryReset();
+      delay(100);
+      ESP.restart();
+    }
+  } else {
+    bootButtonPressed = false;
+  }
+}
+
+void setup() {
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+
+  nvsLoadWifi();
+  nvsLoadSettings();
+  nvsLoadRelayState();
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  sensorData.bmeOk = false;
+  if (bme.begin(0x76, &Wire) || bme.begin(0x77, &Wire)) {
+    bme.setSampling(Adafruit_BME280::MODE_NORMAL,
+                    Adafruit_BME280::SAMPLING_X2,
+                    Adafruit_BME280::SAMPLING_X16,
+                    Adafruit_BME280::SAMPLING_X1,
+                    Adafruit_BME280::FILTER_X16,
+                    Adafruit_BME280::STANDBY_MS_500);
+    sensorData.bmeOk = true;
+  }
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(wifiConfig.ssid, strlen(wifiConfig.pass) > 0 ? wifiConfig.pass : NULL);
+  delay(100);
+
+  IPAddress apIP = WiFi.softAPIP();
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(53, "*", apIP);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/settings", HTTP_GET, handleSettingsPage);
+  server.on("/wifi", HTTP_GET, handleWifiPage);
+  server.on("/api/data", HTTP_GET, handleApiData);
+  server.on("/api/settings", HTTP_GET, handleApiSettingsGet);
+  server.on("/api/settings", HTTP_POST, handleApiSettingsPost);
+  server.on("/api/wifi", HTTP_GET, handleApiWifiGet);
+  server.on("/api/wifi", HTTP_POST, handleApiWifiPost);
+  server.on("/api/relay", HTTP_GET, handleApiRelay);
+  server.on("/generate_204", HTTP_GET, handleCaptivePortal);
+  server.on("/gen_204", HTTP_GET, handleCaptivePortal);
+  server.on("/hotspot-detect.html", HTTP_GET, handleCaptivePortal);
+  server.on("/library/test/success.html", HTTP_GET, handleCaptivePortal);
+  server.on("/connecttest.txt", HTTP_GET, handleCaptivePortal);
+  server.on("/ncsi.txt", HTTP_GET, handleCaptivePortal);
+  server.on("/fwlink", HTTP_GET, handleCaptivePortal);
+  server.on("/redirect", HTTP_GET, handleCaptivePortal);
+  server.on("/canonical.html", HTTP_GET, handleCaptivePortal);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
+
+  lastSensorRead = millis() - SENSOR_READ_INTERVAL_MS;
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  checkBootButton();
+  readSensor();
+  if (relayPersistPending && (long)(millis() - relayPersistDeadline) >= 0) {
+    nvsSaveRelayState();
+    relayPersistPending = false;
+  }
+  esp_task_wdt_reset();
+  delay(2);
+}
