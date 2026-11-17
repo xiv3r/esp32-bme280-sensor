@@ -1,5 +1,5 @@
 /*
- * ESP32 BME280 Controller
+ * ESP32 BME280 Temperature Humidity Barometric Pressure Controller
  */
 
 #include <WiFi.h>
@@ -17,9 +17,14 @@
 #define PIN_RELAY   25
 #define PIN_BOOT    0
 
-static const char* AP_SSID = "ESP32_BME280";
-static const char* AP_PASS = "12345678";
+static const char* DEF_AP_SSID = "ESP32_BME280";
+static const char* DEF_AP_PASS = "12345678";
 static const IPAddress AP_IP(192, 168, 4, 1);
+
+static const uint8_t  AP_SSID_MAX        = 32;
+static const uint8_t  AP_PASS_MIN        = 8;
+static const uint8_t  AP_PASS_MAX        = 63;
+static const uint64_t AP_APPLY_DELAY_MS  = 1200ULL;
 
 static const uint64_t BOOT_HOLD_MS         = 5000ULL;
 static const uint64_t SENSOR_PERIOD_MS     = 2000ULL;
@@ -31,7 +36,7 @@ static const uint64_t REBOOT_DELAY_MS      = 500ULL;
 
 static const int MAX_BODY_SIZE = 8192;
 static const char* NVS_NS  = "bme280cfg";
-static const uint32_t CFG_MAGIC = 0xB6E28042UL;
+static const uint32_t CFG_MAGIC = 0xB6E28043UL;
 
 struct Config {
   uint32_t magic;
@@ -41,6 +46,8 @@ struct Config {
   double   tempOn, tempOff;
   double   humOn,  humOff;
   double   presOn, presOff;
+  char     apSsid[AP_SSID_MAX + 1];
+  char     apPass[AP_PASS_MAX + 1];
   uint32_t crc;
 };
 
@@ -64,6 +71,11 @@ static uint64_t g_bootHoldStart   = 0;
 static bool     g_resetRequested  = false;
 static bool     g_rebootRequested = false;
 static uint64_t g_rebootAtMs      = 0;
+static bool     g_apApplyRequested = false;
+static uint64_t g_apApplyAtMs      = 0;
+
+static uint8_t  g_sensorFailCount = 0;
+static const uint8_t SENSOR_FAIL_LIMIT = 3;
 
 static WebServer   g_server(80);
 static DNSServer   g_dns;
@@ -91,10 +103,30 @@ static int64_t clampI(int64_t v, int64_t lo, int64_t hi, int64_t dflt) {
   if (v < lo || v > hi) return dflt; return v;
 }
 
+static bool apCredsValid(const char* ssid, const char* pass) {
+  size_t sl = strnlen(ssid, AP_SSID_MAX + 1);
+  size_t pl = strnlen(pass, AP_PASS_MAX + 1);
+  if (sl < 1 || sl > AP_SSID_MAX) return false;
+  if (pl != 0 && (pl < AP_PASS_MIN || pl > AP_PASS_MAX)) return false;
+  for (size_t i = 0; i < sl; ++i) {
+    unsigned char ch = (unsigned char)ssid[i];
+    if (ch < 0x20 || ch == 0x7F) return false;
+  }
+  for (size_t i = 0; i < pl; ++i) {
+    unsigned char ch = (unsigned char)pass[i];
+    if (ch < 0x20 || ch == 0x7F) return false;
+  }
+  return true;
+}
+
 static void loadDefaults(Config& c) {
+  memset(&c, 0, sizeof(c));
   c.magic=CFG_MAGIC; c.relayMode=0; c.invertRelay=0; c.sensorAddr=0;
   c.tempOn=30.0; c.tempOff=28.0; c.humOn=70.0; c.humOff=65.0;
-  c.presOn=1020.0; c.presOff=1015.0; c.crc=0; c.crc=cfgChecksum(c);
+  c.presOn=1020.0; c.presOff=1015.0;
+  strncpy(c.apSsid, DEF_AP_SSID, AP_SSID_MAX); c.apSsid[AP_SSID_MAX]=0;
+  strncpy(c.apPass, DEF_AP_PASS, AP_PASS_MAX); c.apPass[AP_PASS_MAX]=0;
+  c.crc=0; c.crc=cfgChecksum(c);
 }
 static bool cfgValid(const Config& c) {
   if (c.magic != CFG_MAGIC) return false;
@@ -108,9 +140,21 @@ static bool cfgValid(const Config& c) {
   if (!(c.humOff  >= 0   && c.humOff  <= 100)) return false;
   if (!(c.presOn  >= 300 && c.presOn  <= 1100)) return false;
   if (!(c.presOff >= 300 && c.presOff <= 1100)) return false;
+  if (c.tempOn <= c.tempOff) return false;
+  if (c.humOn  <= c.humOff)  return false;
+  if (c.presOn <= c.presOff) return false;
+  if (!apCredsValid(c.apSsid, c.apPass)) return false;
   return true;
 }
 static void sanitizeConfig(Config& c) {
+  { Config z; memset(&z,0,sizeof(z));
+    z.magic=c.magic; z.relayMode=c.relayMode; z.invertRelay=c.invertRelay;
+    z.sensorAddr=c.sensorAddr; z.tempOn=c.tempOn; z.tempOff=c.tempOff;
+    z.humOn=c.humOn; z.humOff=c.humOff; z.presOn=c.presOn; z.presOff=c.presOff;
+    memcpy(z.apSsid, c.apSsid, sizeof(z.apSsid));
+    memcpy(z.apPass, c.apPass, sizeof(z.apPass));
+    z.apSsid[AP_SSID_MAX] = 0; z.apPass[AP_PASS_MAX] = 0;
+    c = z; }
   c.relayMode   = clampI(c.relayMode,   0, 3, 0);
   c.invertRelay = clampI(c.invertRelay, 0, 1, 0);
   if (c.sensorAddr != 0 && c.sensorAddr != 0x76 && c.sensorAddr != 0x77) c.sensorAddr = 0;
@@ -120,6 +164,14 @@ static void sanitizeConfig(Config& c) {
   c.humOff  = clampD(c.humOff,   0, 100,   65.0);
   c.presOn  = clampD(c.presOn,  300, 1100, 1020.0);
   c.presOff = clampD(c.presOff, 300, 1100, 1015.0);
+  if (c.tempOn <= c.tempOff) { c.tempOn = 30.0; c.tempOff = 28.0; }
+  if (c.humOn  <= c.humOff)  { c.humOn  = 70.0; c.humOff  = 65.0; }
+  if (c.presOn <= c.presOff) { c.presOn = 1020.0; c.presOff = 1015.0; }
+  c.apSsid[AP_SSID_MAX] = 0; c.apPass[AP_PASS_MAX] = 0;
+  if (!apCredsValid(c.apSsid, c.apPass)) {
+    strncpy(c.apSsid, DEF_AP_SSID, AP_SSID_MAX); c.apSsid[AP_SSID_MAX]=0;
+    strncpy(c.apPass, DEF_AP_PASS, AP_PASS_MAX); c.apPass[AP_PASS_MAX]=0;
+  }
   c.magic   = CFG_MAGIC;
   c.crc     = cfgChecksum(c);
 }
@@ -159,9 +211,8 @@ static void configureSampling() {
                     Adafruit_BME280::STANDBY_MS_1000);
 }
 static bool initSensor() {
-  Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(100000);
-  delay(10);
+  static bool wireStarted = false;
+  if (!wireStarted) { Wire.begin(PIN_SDA, PIN_SCL); Wire.setClock(100000); wireStarted = true; delay(10); }
   int64_t locked = g_cfg.sensorAddr;
   if (locked == 0x76 || locked == 0x77) {
     if (g_bme.begin((uint8_t)locked, &Wire)) { configureSampling(); return true; }
@@ -176,6 +227,14 @@ static void readSensor() {
   float p = g_bme.readPressure() / 100.0f;
   if (!isnan(t) && !isnan(h) && !isnan(p)) {
     g_temperature = t; g_humidity = h; g_pressure = p;
+    g_sensorFailCount = 0;
+  } else {
+    if (g_sensorFailCount < 255) g_sensorFailCount++;
+    if (g_sensorFailCount >= SENSOR_FAIL_LIMIT) {
+      g_temperature = NAN; g_humidity = NAN; g_pressure = NAN;
+      g_bmeOk = false;
+      g_sensorFailCount = 0;
+    }
   }
 }
 static void writeRelayPin(bool on) {
@@ -184,10 +243,9 @@ static void writeRelayPin(bool on) {
   digitalWrite(PIN_RELAY, level);
 }
 static void setRelay(bool on, bool force) {
-  (void)force;
   uint64_t t = nowMs();
   if (on == g_relayOn) return;
-  if ((t - g_lastRelayMs) < RELAY_MIN_TOGGLE_MS) return;
+  if (!force && (t - g_lastRelayMs) < RELAY_MIN_TOGGLE_MS) return;
   writeRelayPin(on);
   g_relayOn = on;
   g_lastRelayMs = t;
@@ -216,7 +274,7 @@ static void serviceBootButton() {
   int level = digitalRead(PIN_BOOT);
   if (level == LOW) {
     if (!g_bootHeld) { g_bootHeld = true; g_bootHoldStart = t; }
-    else if ((t - g_bootHoldStart) >= BOOT_HOLD_MS) g_resetRequested = true;
+    else if (!g_resetRequested && (t - g_bootHoldStart) >= BOOT_HOLD_MS) g_resetRequested = true;
   } else { g_bootHeld = false; g_bootHoldStart = 0; }
 }
 static void performFactoryReset() {
@@ -319,6 +377,21 @@ static void sendPage(const String& body, const char* active) {
 }
 static String fmtF(float v, int d) { if (isnan(v)) return String("--"); return String(v, d); }
 
+static String htmlEscape(const char* s) {
+  String o; o.reserve(strlen(s) + 8);
+  for (const char* p = s; *p; ++p) {
+    switch (*p) {
+      case '&': o += F("&amp;"); break;
+      case '<': o += F("&lt;");  break;
+      case '>': o += F("&gt;");  break;
+      case '"': o += F("&quot;"); break;
+      case '\'': o += F("&#39;"); break;
+      default:  o += *p;
+    }
+  }
+  return o;
+}
+
 static String dashboardBody() {
   String b; b.reserve(2800);
   b += F("<div class='grid'>");
@@ -335,7 +408,8 @@ static String dashboardBody() {
   else if (g_cfg.relayMode==2) b += F("Humidity");
   else b += F("Pressure");
   b += F("</span></div>");
-  b += F("<div class='row'><span>IP</span><span>192.168.4.1</span></div>");
+  b += F("<div class='row'><span>SSID</span><span>"); b += htmlEscape(g_cfg.apSsid); b += F("</span></div>");
+  b += F("<div class='row'><span>IP</span><span>"); b += AP_IP.toString(); b += F("</span></div>");
   b += F("<div class='row'><span>Uptime</span><span>");  b += fmtU64((nowMs()-g_bootMs)/1000ULL); b += F(" s</span></div>");
   b += F("<div class='row'><span>Free Heap</span><span>"); b += fmtU64((uint64_t)ESP.getFreeHeap()); b += F(" B</span></div>");
   b += F("<div class='row'><span>Min Free Heap</span><span>"); b += fmtU64((uint64_t)ESP.getMinFreeHeap()); b += F(" B</span></div>");
@@ -385,13 +459,13 @@ static String sensorBody() {
   b += F("<script>"
          "document.getElementById('f').addEventListener('submit',function(e){"
          "e.preventDefault();var m=document.getElementById('m');m.className='msg';m.textContent='Saving...';"
+         "function num(id){var v=document.getElementById(id).value.trim();return v===''?null:+v;}"
          "var d={mode:+document.getElementById('mode').value,"
-         "ton:+document.getElementById('ton').value,toff:+document.getElementById('toff').value,"
-         "hon:+document.getElementById('hon').value,hoff:+document.getElementById('hoff').value,"
-         "pon:+document.getElementById('pon').value,poff:+document.getElementById('poff').value,"
-         "inv:+document.getElementById('inv').value};"
+         "ton:num('ton'),toff:num('toff'),hon:num('hon'),hoff:num('hoff'),"
+         "pon:num('pon'),poff:num('poff'),inv:+document.getElementById('inv').value};"
+         "for(var k in d){if(d[k]===null)delete d[k];}"
          "post('/api/sensor',d).then(function(r){"
-         "if(r.ok){m.className='msg ok';m.textContent='Saved';t('Saved');setTimeout(reload,600);}"
+         "if(r.ok){m.className='msg ok';m.textContent='Saved (persists within 60s)';t('Saved');setTimeout(reload,600);}"
          "else{m.className='msg err';m.textContent=(r.msg||'Error');t(r.msg||'Error');}"
          "}).catch(function(){m.className='msg err';m.textContent='Network error';});"
          "});</script>");
@@ -399,20 +473,47 @@ static String sensorBody() {
 }
 
 static String wifiBody() {
-  String b; b.reserve(1800);
+  String b; b.reserve(2600);
   b += F("<div class='card'><h2>Access Point</h2>");
-  b += F("<div class='row'><span>SSID</span><span>"); b += AP_SSID; b += F("</span></div>");
-  b += F("<div class='row'><span>Password</span><span>"); b += AP_PASS; b += F("</span></div>");
-  b += F("<div class='row'><span>IP Address</span><span>192.168.4.1</span></div>");
-  b += F("<div class='row'><span>Security</span><span>WPA2-PSK</span></div>");
+  b += F("<div class='row'><span>SSID</span><span>"); b += htmlEscape(g_cfg.apSsid); b += F("</span></div>");
+  b += F("<div class='row'><span>Security</span><span>");
+  b += (g_cfg.apPass[0] == 0) ? F("OPEN") : F("WPA2-PSK");
+  b += F("</span></div>");
+  b += F("<div class='row'><span>IP Address</span><span>"); b += AP_IP.toString(); b += F("</span></div>");
   b += F("<div class='row'><span>Channel</span><span>"); b += fmtU64((uint64_t)WiFi.channel()); b += F("</span></div>");
   b += F("<div class='row'><span>Clients</span><span>"); b += fmtU64((uint64_t)WiFi.softAPgetStationNum()); b += F("</span></div>");
   b += F("<div class='row'><span>Status</span><span class='badge b-ok'>ACTIVE</span></div>");
+  b += F("</div>");
+  b += F("<div class='card'><h2>AP Credentials</h2><form id='wf'>");
+  b += F("<label>SSID (1-32 chars)</label>");
+  b += F("<input id='ssid' type='text' maxlength='32' value='"); b += htmlEscape(g_cfg.apSsid); b += F("'>");
+  b += F("<label>Password (empty = open, else 8-63 chars)</label>");
+  b += F("<input id='pass' type='password' maxlength='63' autocomplete='new-password' placeholder='Leave blank to keep current'>");
+  b += F("<label style='display:flex;align-items:center;gap:8px;color:var(--mut)'>");
+  b += F("<input id='showpass' type='checkbox' style='width:auto;margin:0' onchange=\"document.getElementById('pass').type=this.checked?'text':'password'\">Show password</label>");
+  b += F("<label style='display:flex;align-items:center;gap:8px;color:var(--mut)'>");
+  b += F("<input id='setpass' type='checkbox' style='width:auto;margin:0'>Set password (check to change; leave unchecked to keep current)</label>");
+  b += F("<button class='primary' type='submit'>Save &amp; Apply</button>");
+  b += F("<div id='wm' class='msg'></div>");
+  b += F("</form>");
+  b += F("<div class='msg' style='color:var(--warn)'>Changing SSID or password will disconnect all clients. Reconnect to the new network afterward.</div>");
   b += F("</div>");
   b += F("<div class='card'><h2>Actions</h2><div class='btns'>");
   b += F("<button onclick=\"if(confirm('Reboot device?')){post('/api/reboot',{});t('Rebooting...');setTimeout(reload,6000);}\">Reboot</button>");
   b += F("<button class='danger' onclick=\"if(confirm('Factory reset ALL settings?')){post('/api/factoryreset',{});t('Resetting...');setTimeout(reload,7000);}\">Factory Reset</button>");
   b += F("</div></div>");
+  b += F("<script>"
+         "document.getElementById('wf').addEventListener('submit',function(e){"
+         "e.preventDefault();var m=document.getElementById('wm');m.className='msg';m.textContent='Saving...';"
+         "var ssid=document.getElementById('ssid').value;"
+         "var setpass=document.getElementById('setpass').checked;"
+         "var pass=document.getElementById('pass').value;"
+         "var d={ssid:ssid};if(setpass)d.pass=pass;"
+         "post('/api/wifi',d).then(function(r){"
+         "if(r.ok){m.className='msg ok';m.textContent='Saved. Reconnecting to new AP...';t('AP updated');setTimeout(reload,6000);}"
+         "else{m.className='msg err';m.textContent=(r.msg||'Error');t(r.msg||'Error');}"
+         "}).catch(function(){m.className='msg err';m.textContent='Network error (AP may be changing)';});"
+         "});</script>");
   return b;
 }
 
@@ -446,7 +547,14 @@ static void handleApiRelay() {
   if (!g_server.hasArg("plain")) { sendJsonErr("no body"); return; }
   String body = g_server.arg("plain");
   if ((int)body.length() > MAX_BODY_SIZE) { sendJsonErr("too large"); return; }
-  bool on = body.indexOf("\"on\":true") >= 0;
+  int k = body.indexOf("\"on\":");
+  if (k < 0) { sendJsonErr("missing on"); return; }
+  int s = k + 5;
+  while (s < (int)body.length() && (body[s]==' '||body[s]=='\t')) s++;
+  bool on;
+  if (body.startsWith("true",  s)) on = true;
+  else if (body.startsWith("false", s)) on = false;
+  else { sendJsonErr("bad on"); return; }
   setRelay(on, true);
   sendJsonOk();
 }
@@ -455,11 +563,14 @@ static void handleApiRelayMode() {
   String body = g_server.arg("plain");
   int idx = body.indexOf("\"mode\":");
   if (idx < 0) { sendJsonErr("bad body"); return; }
-  long m = body.substring(idx + 7).toInt();
+  int s = idx + 7;
+  while (s < (int)body.length() && (body[s]==' '||body[s]=='\t')) s++;
+  long m = body.substring(s).toInt();
   if (m < 0 || m > 3) { sendJsonErr("range"); return; }
   if (g_cfg.relayMode != (int64_t)m) {
     g_cfg.relayMode = (int64_t)m;
     markConfigDirty();
+    if (m == 0) setRelay(false, true);
   }
   sendJsonOk();
 }
@@ -469,10 +580,11 @@ static double parseField(const String& body, const char* key, double dflt, bool*
   int idx = body.indexOf(k);
   if (idx < 0) return dflt;
   int s = idx + k.length();
+  while (s < (int)body.length() && (body[s]==' '||body[s]=='\t')) s++;
   int e = s;
   while (e < (int)body.length()) {
     char c = body[e];
-    if (c==',' || c=='}' || c=='\n' || c==' ' || c=='\r') break;
+    if (c==',' || c=='}' || c=='\n' || c==' ' || c=='\r' || c=='\t') break;
     e++;
   }
   if (e <= s) return dflt;
@@ -503,20 +615,118 @@ static void handleApiSensor() {
   if (!(nc.humOff  >= 0    && nc.humOff  <= 100)) { sendJsonErr("humOff range");     return; }
   if (!(nc.presOn  >= 300  && nc.presOn  <= 1100)){ sendJsonErr("presOn range");     return; }
   if (!(nc.presOff >= 300  && nc.presOff <= 1100)){ sendJsonErr("presOff range");    return; }
-  if (nc.relayMode == 1 && nc.tempOn <= nc.tempOff) { sendJsonErr("temp ON must exceed OFF"); return; }
-  if (nc.relayMode == 2 && nc.humOn  <= nc.humOff)  { sendJsonErr("hum ON must exceed OFF");  return; }
-  if (nc.relayMode == 3 && nc.presOn <= nc.presOff) { sendJsonErr("pres ON must exceed OFF"); return; }
+  if (nc.tempOn <= nc.tempOff) { sendJsonErr("temp ON must exceed OFF"); return; }
+  if (nc.humOn  <= nc.humOff)  { sendJsonErr("hum ON must exceed OFF");  return; }
+  if (nc.presOn <= nc.presOff) { sendJsonErr("pres ON must exceed OFF"); return; }
 
   bool polarityChanged = (nc.invertRelay != g_cfg.invertRelay);
+  { Config z; memset(&z,0,sizeof(z));
+    z.magic=nc.magic; z.relayMode=nc.relayMode; z.invertRelay=nc.invertRelay;
+    z.sensorAddr=nc.sensorAddr; z.tempOn=nc.tempOn; z.tempOff=nc.tempOff;
+    z.humOn=nc.humOn; z.humOff=nc.humOff; z.presOn=nc.presOn; z.presOff=nc.presOff;
+    memcpy(z.apSsid, nc.apSsid, sizeof(z.apSsid));
+    memcpy(z.apPass, nc.apPass, sizeof(z.apPass));
+    nc = z; }
   nc.magic = CFG_MAGIC; nc.crc = 0; nc.crc = cfgChecksum(nc);
 
-  if (memcmp(&nc, &g_cfg, offsetof(Config, crc)) != 0) {
-    g_cfg = nc;
-    g_cfgDirty = true;
+  { Config a; memset(&a,0,sizeof(a));
+    a.magic=g_cfg.magic; a.relayMode=g_cfg.relayMode; a.invertRelay=g_cfg.invertRelay;
+    a.sensorAddr=g_cfg.sensorAddr; a.tempOn=g_cfg.tempOn; a.tempOff=g_cfg.tempOff;
+    a.humOn=g_cfg.humOn; a.humOff=g_cfg.humOff; a.presOn=g_cfg.presOn; a.presOff=g_cfg.presOff;
+    memcpy(a.apSsid, g_cfg.apSsid, sizeof(a.apSsid));
+    memcpy(a.apPass, g_cfg.apPass, sizeof(a.apPass));
+    if (memcmp(&nc, &a, offsetof(Config, crc)) != 0) {
+      g_cfg = nc;
+      g_cfgDirty = true;
+    }
   }
   if (polarityChanged) writeRelayPin(g_relayOn);
   sendJsonOk();
 }
+
+static int parseJsonString(const String& body, const char* key, char* out, size_t outCap, bool* truncated) {
+  if (truncated) *truncated = false;
+  String k; k.reserve(24); k += '"'; k += key; k += F("\":");
+  int idx = body.indexOf(k);
+  if (idx < 0) return 0;
+  int s = idx + k.length();
+  while (s < (int)body.length() && (body[s]==' '||body[s]=='\t')) s++;
+  if (s >= (int)body.length() || body[s] != '"') return -1;
+  s++;
+  size_t o = 0; bool trunc = false;
+  while (s < (int)body.length()) {
+    char c = body[s++];
+    if (c == '"') { out[o < outCap ? o : outCap-1] = 0; if (trunc && truncated) *truncated = true; return 1; }
+    if (c == '\\' && s < (int)body.length()) {
+      char e = body[s++];
+      switch (e) {
+        case '"':  c='"';  break;  case '\\': c='\\'; break;
+        case '/':  c='/';  break;  case 'n':  c='\n'; break;
+        case 't':  c='\t'; break;  case 'r':  c='\r'; break;
+        case 'b':  c='\b'; break;  case 'f':  c='\f'; break;
+        default:   c=e;    break;
+      }
+    }
+    if (o + 1 < outCap) out[o++] = c; else trunc = true;
+  }
+  return -1;
+}
+
+static void handleApiWifi() {
+  if (!g_server.hasArg("plain")) { sendJsonErr("no body"); return; }
+  String body = g_server.arg("plain");
+  if ((int)body.length() > MAX_BODY_SIZE) { sendJsonErr("too large"); return; }
+
+  Config nc = g_cfg;
+  char tmpSsid[AP_SSID_MAX + 1] = {0};
+  char tmpPass[AP_PASS_MAX + 1] = {0};
+  bool truncS = false, truncP = false;
+  int rs = parseJsonString(body, "ssid", tmpSsid, sizeof(tmpSsid), &truncS);
+  int rp = parseJsonString(body, "pass", tmpPass, sizeof(tmpPass), &truncP);
+  if (rs < 0) { sendJsonErr("ssid malformed"); return; }
+  if (rp < 0) { sendJsonErr("pass malformed"); return; }
+  if (truncS) { sendJsonErr("ssid too long (max 32 bytes)"); return; }
+  if (truncP) { sendJsonErr("pass too long (max 63 chars)"); return; }
+  bool hasSsid = (rs == 1), hasPass = (rp == 1);
+
+  if (!hasSsid && !hasPass) { sendJsonErr("nothing to set"); return; }
+
+  if (hasSsid) {
+    size_t sl = strnlen(tmpSsid, sizeof(tmpSsid));
+    if (sl < 1 || sl > AP_SSID_MAX) { sendJsonErr("ssid length 1-32"); return; }
+    for (size_t i = 0; i < sl; ++i) {
+      unsigned char ch = (unsigned char)tmpSsid[i];
+      if (ch < 0x20 || ch == 0x7F) { sendJsonErr("ssid has control chars"); return; }
+    }
+    memcpy(nc.apSsid, tmpSsid, sl + 1);
+  }
+  if (hasPass) {
+    size_t pl = strnlen(tmpPass, sizeof(tmpPass));
+    if (pl != 0 && (pl < AP_PASS_MIN || pl > AP_PASS_MAX)) {
+      sendJsonErr("pass must be empty or 8-63 chars"); return;
+    }
+    for (size_t i = 0; i < pl; ++i) {
+      unsigned char ch = (unsigned char)tmpPass[i];
+      if (ch < 0x20 || ch == 0x7F) { sendJsonErr("pass has control chars"); return; }
+    }
+    memcpy(nc.apPass, tmpPass, pl + 1);
+  }
+
+  bool changed = false;
+  if (hasSsid && strcmp(nc.apSsid, g_cfg.apSsid) != 0) changed = true;
+  if (hasPass && strcmp(nc.apPass, g_cfg.apPass) != 0) changed = true;
+  if (!changed) { sendJsonOk(); return; }
+
+  nc.magic = CFG_MAGIC; nc.crc = 0; nc.crc = cfgChecksum(nc);
+  g_cfg = nc;
+  g_cfgDirty = true;
+  saveConfigNow();
+
+  sendJsonOk();
+  g_apApplyRequested = true;
+  g_apApplyAtMs = nowMs() + AP_APPLY_DELAY_MS;
+}
+
 static void handleApiReboot() {
   sendJsonOk();
   g_rebootRequested = true;
@@ -537,7 +747,13 @@ static void setupWifi() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPsetHostname("esp32-bme280");
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255,255,255,0));
-  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+  const char* pass = (g_cfg.apPass[0] == 0) ? nullptr : g_cfg.apPass;
+  bool ok = WiFi.softAP(g_cfg.apSsid, pass, 1, 0, 4);
+  if (!ok) {
+    if (!WiFi.softAP(DEF_AP_SSID, DEF_AP_PASS, 1, 0, 4)) {
+      delay(100); ESP.restart();
+    }
+  }
 }
 static void setupDns() {
   g_dns.setErrorReplyCode(DNSReplyCode::NoError);
@@ -551,6 +767,7 @@ static void setupServer() {
   g_server.on("/api/relay",        HTTP_POST, handleApiRelay);
   g_server.on("/api/relaymode",    HTTP_POST, handleApiRelayMode);
   g_server.on("/api/sensor",       HTTP_POST, handleApiSensor);
+  g_server.on("/api/wifi",         HTTP_POST, handleApiWifi);
   g_server.on("/api/reboot",       HTTP_POST, handleApiReboot);
   g_server.on("/api/factoryreset", HTTP_POST, handleApiFactoryReset);
 
@@ -613,6 +830,14 @@ void loop() {
     ESP.restart();
     return;
   }
+  if (g_apApplyRequested && nowMs() >= g_apApplyAtMs) {
+    g_apApplyRequested = false;
+    WiFi.softAPdisconnect(true);
+    delay(80);
+    setupWifi();
+    g_dns.stop();
+    setupDns();
+  }
 
   uint64_t t = nowMs();
 
@@ -623,11 +848,12 @@ void loop() {
         g_lastSensorTryMs = t;
         int64_t prev = g_cfg.sensorAddr;
         g_bmeOk = initSensor();
+        g_sensorFailCount = 0;
         if (g_bmeOk && g_cfg.sensorAddr != prev) markConfigDirty();
       }
     } else {
       readSensor();
-      evaluateRelay();
+      if (g_bmeOk) evaluateRelay();
     }
   }
 
