@@ -36,6 +36,7 @@ jobs:
         # Install libraries
         arduino-cli lib install "Adafruit Unified Sensor"
         arduino-cli lib install "Adafruit BME280 Library"
+        arduino-cli lib install "ArduinoJson"
 
         # Compile firmware
         mv *.ino esp32-bme280-sensor.ino
