@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -12,6 +11,7 @@
 #include <esp_timer.h>
 #include <esp_task_wdt.h>
 #include <esp_wifi.h>
+#include <esp_log.h>
 #include <esp_idf_version.h>
 #include <math.h>
 #include <string.h>
@@ -24,11 +24,12 @@ static constexpr uint64_t PIN_RELAY_HUMIDITY    = 26ULL;
 static constexpr uint64_t PIN_RELAY_PRESSURE    = 27ULL;
 static constexpr uint64_t PIN_FACTORY_RESET_BTN = 0ULL;
 
-static constexpr uint64_t CFG_MAGIC             = 0x424D453238305632ULL;
-static constexpr uint64_t CFG_VERSION           = 2ULL;
+static constexpr uint64_t CFG_MAGIC             = 0x424D453238305634ULL;
+static constexpr uint64_t CFG_VERSION           = 4ULL;
 static constexpr uint64_t FACTORY_RESET_HOLD_MS = 5000ULL;
 static constexpr uint64_t BTN_DEBOUNCE_MS       = 40ULL;
 static constexpr uint64_t BME_RECOVERY_RETRY_MS = 5000ULL;
+static constexpr uint64_t BME_WARMUP_DELAY_MS   = 35ULL;
 static constexpr uint64_t NVS_COMMIT_DELAY_MS   = 600ULL;
 static constexpr uint64_t NVS_MIN_WRITE_GAP_MS  = 2000ULL;
 static constexpr uint64_t ACTION_DELAY_MS       = 800ULL;
@@ -90,13 +91,20 @@ struct alignas(8) SystemConfig {
 };
 
 struct alignas(8) RuntimeState {
+  uint64_t i2cInitialized;
   uint64_t sensorHealthy;
+  uint64_t hasValidSample;
   uint64_t activeI2CAddress;
+  uint64_t sensorWarmupUntilMs;
   uint64_t lastSensorPollMs;
   uint64_t lastSensorInitTryMs;
   uint64_t consecutiveSensorErrors;
   uint64_t totalSensorReads;
   uint64_t totalSensorFaults;
+
+  double   rawTempC;
+  double   rawHumPct;
+  double   rawPresHpa;
 
   double   temperatureC;
   double   temperatureF;
@@ -141,7 +149,7 @@ static Preferences      g_prefs;
 static IPAddress        g_apIP(192, 168, 4, 1);
 static IPAddress        g_netMask(255, 255, 255, 0);
 
-static char             g_jsonBuf[2560];
+static char             g_jsonBuf[3072];
 
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html lang="en">
@@ -652,7 +660,7 @@ input:checked + .slider:before{transform:translateX(20px);}
       <div class="card">
         <div>
           <div class="card-header">
-            <span class="card-title">Temperature (GPIO 25)</span>
+            <span id="dashTitleTemp" class="card-title">Temperature (GPIO 25)</span>
             <span id="badgeTemp" class="badge badge-ok">NORMAL</span>
           </div>
           <div class="metric-main">
@@ -674,7 +682,7 @@ input:checked + .slider:before{transform:translateX(20px);}
       <div class="card">
         <div>
           <div class="card-header">
-            <span class="card-title">Humidity (GPIO 26 / 25)</span>
+            <span id="dashTitleHum" class="card-title">Humidity (GPIO 25 Unified)</span>
             <span id="badgeHum" class="badge badge-ok">NORMAL</span>
           </div>
           <div class="metric-main">
@@ -696,7 +704,7 @@ input:checked + .slider:before{transform:translateX(20px);}
       <div class="card">
         <div>
           <div class="card-header">
-            <span class="card-title">Pressure (GPIO 27 / 25)</span>
+            <span id="dashTitlePres" class="card-title">Pressure (GPIO 25 Unified)</span>
             <span id="badgePres" class="badge badge-ok">NORMAL</span>
           </div>
           <div class="metric-main">
@@ -793,11 +801,11 @@ input:checked + .slider:before{transform:translateX(20px);}
         <div class="form-row">
           <div class="form-group">
             <label class="form-label" for="relayMode">Relay Control Mode</label>
-            <select id="relayMode" class="select">
+            <select id="relayMode" class="select" onchange="syncRelayModeLabels()">
               <option value="0">Unified Control (GPIO 25 triggers on ANY sensor threshold)</option>
               <option value="1">Individual Control (GPIO 25=Temp, GPIO 26=Humidity, GPIO 27=Pressure)</option>
             </select>
-            <span class="form-hint">Select Unified (single relay on GPIO 25) or Individual 3-channel relay outputs.</span>
+            <span class="form-hint">Select Unified (single relay on GPIO 25) or Individual 3-channel relay outputs (GPIO 25, 26, 27).</span>
           </div>
           <div class="form-group">
             <label class="form-label" for="relayActiveLow">Relay Electrical Polarity</label>
@@ -819,13 +827,13 @@ input:checked + .slider:before{transform:translateX(20px);}
           </div>
           <div class="form-group">
             <label class="form-label" for="minRelaySwitchMs">Minimum Relay Switch Hold Time (ms)</label>
-            <input type="number" id="minRelaySwitchMs" class="input" min="0" max="300000" step="100" required>
+            <input type="number" id="minRelaySwitchMs" class="input" min="0" max="300000" step="1" required>
             <span class="form-hint">Anti-short-cycle protection (0 to 300,000 ms).</span>
           </div>
         </div>
         <div class="form-group">
           <label class="form-label" for="sensorPollMs">BME280 Sampling Interval (ms)</label>
-          <input type="number" id="sensorPollMs" class="input" min="250" max="60000" step="50" required>
+          <input type="number" id="sensorPollMs" class="input" min="250" max="60000" step="1" required>
           <span class="form-hint">Non-blocking sensor read period between 250 ms and 60,000 ms.</span>
         </div>
       </div>
@@ -835,7 +843,7 @@ input:checked + .slider:before{transform:translateX(20px);}
         <div class="card">
           <div>
             <div class="card-header">
-              <span class="card-title">Temperature Rules (GPIO 25)</span>
+              <span id="cfgTitleTemp" class="card-title">Temperature Rules (GPIO 25)</span>
               <span class="badge badge-ok">&deg;C</span>
             </div>
             <div class="toggle-row">
@@ -854,21 +862,21 @@ input:checked + .slider:before{transform:translateX(20px);}
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label" for="tempHigh">High Threshold (&deg;C)</label>
-                <input type="number" id="tempHigh" class="input" min="-40" max="85" step="0.1" required>
+                <input type="number" id="tempHigh" class="input" min="-40" max="85" step="0.01" required>
               </div>
               <div class="form-group">
                 <label class="form-label" for="tempLow">Low Threshold (&deg;C)</label>
-                <input type="number" id="tempLow" class="input" min="-40" max="85" step="0.1" required>
+                <input type="number" id="tempLow" class="input" min="-40" max="85" step="0.01" required>
               </div>
             </div>
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label" for="tempHyst">Hysteresis (&deg;C)</label>
-                <input type="number" id="tempHyst" class="input" min="0" max="20" step="0.1" required>
+                <input type="number" id="tempHyst" class="input" min="0" max="20" step="0.01" required>
               </div>
               <div class="form-group">
                 <label class="form-label" for="tempOffset">Calibration Offset (&deg;C)</label>
-                <input type="number" id="tempOffset" class="input" min="-15" max="15" step="0.05" required>
+                <input type="number" id="tempOffset" class="input" min="-15" max="15" step="0.01" required>
               </div>
             </div>
           </div>
@@ -878,7 +886,7 @@ input:checked + .slider:before{transform:translateX(20px);}
         <div class="card">
           <div>
             <div class="card-header">
-              <span class="card-title">Humidity Rules (GPIO 26 / 25)</span>
+              <span id="cfgTitleHum" class="card-title">Humidity Rules (GPIO 25 Unified)</span>
               <span class="badge badge-ok">%RH</span>
             </div>
             <div class="toggle-row">
@@ -897,21 +905,21 @@ input:checked + .slider:before{transform:translateX(20px);}
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label" for="humHigh">High Threshold (%RH)</label>
-                <input type="number" id="humHigh" class="input" min="0" max="100" step="0.5" required>
+                <input type="number" id="humHigh" class="input" min="0" max="100" step="0.01" required>
               </div>
               <div class="form-group">
                 <label class="form-label" for="humLow">Low Threshold (%RH)</label>
-                <input type="number" id="humLow" class="input" min="0" max="100" step="0.5" required>
+                <input type="number" id="humLow" class="input" min="0" max="100" step="0.01" required>
               </div>
             </div>
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label" for="humHyst">Hysteresis (%RH)</label>
-                <input type="number" id="humHyst" class="input" min="0" max="30" step="0.5" required>
+                <input type="number" id="humHyst" class="input" min="0" max="30" step="0.01" required>
               </div>
               <div class="form-group">
                 <label class="form-label" for="humOffset">Calibration Offset (%RH)</label>
-                <input type="number" id="humOffset" class="input" min="-25" max="25" step="0.1" required>
+                <input type="number" id="humOffset" class="input" min="-25" max="25" step="0.01" required>
               </div>
             </div>
           </div>
@@ -921,7 +929,7 @@ input:checked + .slider:before{transform:translateX(20px);}
         <div class="card">
           <div>
             <div class="card-header">
-              <span class="card-title">Pressure Rules (GPIO 27 / 25)</span>
+              <span id="cfgTitlePres" class="card-title">Pressure Rules (GPIO 25 Unified)</span>
               <span class="badge badge-ok">hPa</span>
             </div>
             <div class="toggle-row">
@@ -940,21 +948,21 @@ input:checked + .slider:before{transform:translateX(20px);}
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label" for="presHigh">High Threshold (hPa)</label>
-                <input type="number" id="presHigh" class="input" min="300" max="1100" step="0.5" required>
+                <input type="number" id="presHigh" class="input" min="300" max="1100" step="0.01" required>
               </div>
               <div class="form-group">
                 <label class="form-label" for="presLow">Low Threshold (hPa)</label>
-                <input type="number" id="presLow" class="input" min="300" max="1100" step="0.5" required>
+                <input type="number" id="presLow" class="input" min="300" max="1100" step="0.01" required>
               </div>
             </div>
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label" for="presHyst">Hysteresis (hPa)</label>
-                <input type="number" id="presHyst" class="input" min="0" max="50" step="0.5" required>
+                <input type="number" id="presHyst" class="input" min="0" max="50" step="0.01" required>
               </div>
               <div class="form-group">
                 <label class="form-label" for="presOffset">Calibration Offset (hPa)</label>
-                <input type="number" id="presOffset" class="input" min="-50" max="50" step="0.1" required>
+                <input type="number" id="presOffset" class="input" min="-50" max="50" step="0.01" required>
               </div>
             </div>
           </div>
@@ -1106,6 +1114,13 @@ function switchTab(tabId) {
   if (btn) btn.classList.add('active');
 }
 
+function syncRelayModeLabels() {
+  const isUnif = Number(document.getElementById('relayMode').value) === 0;
+  document.getElementById('cfgTitleTemp').textContent = isUnif ? 'Temperature Rules (GPIO 25 Unified)' : 'Temperature Rules (GPIO 25)';
+  document.getElementById('cfgTitleHum').textContent  = isUnif ? 'Humidity Rules (GPIO 25 Unified)'    : 'Humidity Rules (GPIO 26)';
+  document.getElementById('cfgTitlePres').textContent = isUnif ? 'Pressure Rules (GPIO 25 Unified)'    : 'Pressure Rules (GPIO 27)';
+}
+
 function togglePass() {
   const inp = document.getElementById('wifiPass');
   const btn = document.querySelector('.pass-toggle');
@@ -1185,11 +1200,14 @@ function updateBar(barId, val, low, high, trig) {
   else el.classList.remove('trig');
 }
 
-function updateBadge(id, enabled, trig, healthy) {
+function updateBadge(id, enabled, trig, healthy, hasSample) {
   const el = document.getElementById(id);
   if (!healthy) {
     el.className = 'badge badge-danger';
     el.textContent = 'SENSOR FAULT';
+  } else if (!hasSample) {
+    el.className = 'badge badge-warn';
+    el.textContent = 'WARMING UP';
   } else if (!enabled) {
     el.className = 'badge badge-muted';
     el.textContent = 'DISABLED';
@@ -1215,7 +1233,8 @@ async function pollStatus() {
     document.getElementById('dotConn').className = 'dot ok';
     document.getElementById('txtConn').textContent = 'Link Active';
 
-    const healthy = Number(d.sensorHealthy) === 1;
+    const healthy   = Number(d.sensorHealthy) === 1;
+    const hasSample = Number(d.hasSample) === 1;
     document.getElementById('dotBme').className = healthy ? 'dot ok' : 'dot err';
     document.getElementById('txtBme').textContent = healthy ? ('BME280 0x' + Number(d.i2cAddr).toString(16).toUpperCase()) : 'BME280 Fault';
 
@@ -1223,7 +1242,11 @@ async function pollStatus() {
     document.getElementById('pillMode').textContent = unif ? 'Mode: Unified (GPIO 25)' : 'Mode: Individual (25/26/27)';
     document.getElementById('pillUptime').textContent = 'Uptime: ' + formatUptime(d.uptimeMs);
 
-    if (healthy) {
+    document.getElementById('dashTitleTemp').textContent = unif ? 'Temperature (GPIO 25 Unified)' : 'Temperature (GPIO 25)';
+    document.getElementById('dashTitleHum').textContent  = unif ? 'Humidity (GPIO 25 Unified)'    : 'Humidity (GPIO 26)';
+    document.getElementById('dashTitlePres').textContent = unif ? 'Pressure (GPIO 25 Unified)'    : 'Pressure (GPIO 27)';
+
+    if (healthy && hasSample) {
       document.getElementById('valTempC').textContent = Number(d.tempC).toFixed(2);
       document.getElementById('valTempSub').textContent = Number(d.tempF).toFixed(2) + ' \u00B0F | Offset: ' + Number(d.tempOffset).toFixed(2) + ' \u00B0C';
       document.getElementById('valHum').textContent = Number(d.humPct).toFixed(2);
@@ -1231,8 +1254,8 @@ async function pollStatus() {
       document.getElementById('valPres').textContent = Number(d.presHpa).toFixed(2);
       document.getElementById('valPresSub').textContent = 'Est. Altitude: ' + Number(d.altM).toFixed(1) + ' m | Offset: ' + Number(d.presOffset).toFixed(2) + ' hPa';
 
-      histTemp.push(Number(d.tempC)); if (histTemp.length > MAX_PTS) histTemp.shift();
-      histHum.push(Number(d.humPct)); if (histHum.length > MAX_PTS) histHum.shift();
+      histTemp.push(Number(d.tempC));   if (histTemp.length > MAX_PTS) histTemp.shift();
+      histHum.push(Number(d.humPct));   if (histHum.length > MAX_PTS)  histHum.shift();
       histPres.push(Number(d.presHpa)); if (histPres.length > MAX_PTS) histPres.shift();
 
       drawSpark('sparkTemp', histTemp, '#38bdf8');
@@ -1256,13 +1279,15 @@ async function pollStatus() {
     document.getElementById('metaPresHigh').textContent = 'High: ' + Number(d.presHigh).toFixed(1) + ' hPa';
     document.getElementById('metaPresCond').textContent = condName(d.presCond);
 
-    updateBadge('badgeTemp', Number(d.tempEn) === 1, Number(d.tempTrig) === 1, healthy);
-    updateBadge('badgeHum',  Number(d.humEn)  === 1, Number(d.humTrig)  === 1, healthy);
-    updateBadge('badgePres', Number(d.presEn) === 1, Number(d.presTrig) === 1, healthy);
+    updateBadge('badgeTemp', Number(d.tempEn) === 1, Number(d.tempTrig) === 1, healthy, hasSample);
+    updateBadge('badgeHum',  Number(d.humEn)  === 1, Number(d.humTrig)  === 1, healthy, hasSample);
+    updateBadge('badgePres', Number(d.presEn) === 1, Number(d.presTrig) === 1, healthy, hasSample);
 
-    updateBar('barTemp', Number(d.tempC),   Number(d.tempLow), Number(d.tempHigh), Number(d.tempTrig) === 1);
-    updateBar('barHum',  Number(d.humPct),  Number(d.humLow),  Number(d.humHigh),  Number(d.humTrig)  === 1);
-    updateBar('barPres', Number(d.presHpa), Number(d.presLow), Number(d.presHigh), Number(d.presTrig) === 1);
+    if (healthy && hasSample) {
+      updateBar('barTemp', Number(d.tempC),   Number(d.tempLow), Number(d.tempHigh), Number(d.tempTrig) === 1);
+      updateBar('barHum',  Number(d.humPct),  Number(d.humLow),  Number(d.humHigh),  Number(d.humTrig)  === 1);
+      updateBar('barPres', Number(d.presHpa), Number(d.presLow), Number(d.presHigh), Number(d.presTrig) === 1);
+    }
 
     document.getElementById('badgeRelayMode').textContent = unif ? 'UNIFIED RELAY (GPIO 25)' : 'INDIVIDUAL RELAYS (25/26/27)';
     document.getElementById('lblR0Title').textContent = unif ? 'GPIO 25 (Unified)' : 'GPIO 25 (Temperature)';
@@ -1343,6 +1368,7 @@ async function loadAllSettings(notify) {
     document.getElementById('wifiMaxConn').value      = String(s.wifiMaxConn);
     document.getElementById('wifiHidden').checked     = Number(s.wifiHidden) === 1;
 
+    syncRelayModeLabels();
     if (notify) showToast('Configuration reloaded from controller', true);
   } catch (e) {
     if (notify) showToast('Unable to load configuration', false);
@@ -1358,9 +1384,9 @@ async function saveSensorSettings(ev) {
   const pHigh = parseFloat(document.getElementById('presHigh').value);
   const pLow  = parseFloat(document.getElementById('presLow').value);
 
-  if (tLow >= tHigh) { showToast('Temperature Low threshold must be less than High threshold', false); return; }
-  if (hLow >= hHigh) { showToast('Humidity Low threshold must be less than High threshold', false); return; }
-  if (pLow >= pHigh) { showToast('Pressure Low threshold must be less than High threshold', false); return; }
+  if ((tHigh - tLow) < 0.1) { showToast('Temperature High threshold must be at least 0.1 \u00B0C above Low threshold', false); return; }
+  if ((hHigh - hLow) < 0.5) { showToast('Humidity High threshold must be at least 0.5 %RH above Low threshold', false); return; }
+  if ((pHigh - pLow) < 0.5) { showToast('Pressure High threshold must be at least 0.5 hPa above Low threshold', false); return; }
 
   const payload = {
     relayMode:        parseInt(document.getElementById('relayMode').value, 10),
@@ -1493,8 +1519,19 @@ window.addEventListener('DOMContentLoaded', () => {
 </body>
 </html>)rawliteral";
 
+static uint64_t getMicros64() {
+  return (uint64_t)esp_timer_get_time();
+}
+
 static uint64_t getMillis64() {
   return (uint64_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static void spinWaitMicros64(uint64_t us) {
+  const uint64_t startUs = getMicros64();
+  while ((getMicros64() - startUs) < us) {
+    NOP();
+  }
 }
 
 static uint64_t computeConfigChecksum(const SystemConfig* cfg) {
@@ -1512,6 +1549,10 @@ static uint64_t isDoubleFinite(double val) {
   return (!isnan(val) && !isinf(val)) ? 1ULL : 0ULL;
 }
 
+static double safeJsonDouble(double val) {
+  return isDoubleFinite(val) ? val : 0.0;
+}
+
 static uint64_t validateConfig(const SystemConfig* cfg) {
   if (cfg->magic != CFG_MAGIC) return 0ULL;
   if (cfg->version != CFG_VERSION) return 0ULL;
@@ -1524,21 +1565,21 @@ static uint64_t validateConfig(const SystemConfig* cfg) {
   if (cfg->tempEnable > 1ULL || cfg->tempCondition > COND_INSIDE_RANGE) return 0ULL;
   if (!isDoubleFinite(cfg->tempHigh) || !isDoubleFinite(cfg->tempLow) ||
       !isDoubleFinite(cfg->tempHyst) || !isDoubleFinite(cfg->tempOffset)) return 0ULL;
-  if (cfg->tempLow >= cfg->tempHigh || cfg->tempLow < -45.0 || cfg->tempHigh > 90.0) return 0ULL;
+  if ((cfg->tempHigh - cfg->tempLow) < 0.1 || cfg->tempLow < -45.0 || cfg->tempHigh > 90.0) return 0ULL;
   if (cfg->tempHyst < 0.0 || cfg->tempHyst > 25.0) return 0ULL;
   if (cfg->tempOffset < -20.0 || cfg->tempOffset > 20.0) return 0ULL;
 
   if (cfg->humEnable > 1ULL || cfg->humCondition > COND_INSIDE_RANGE) return 0ULL;
   if (!isDoubleFinite(cfg->humHigh) || !isDoubleFinite(cfg->humLow) ||
       !isDoubleFinite(cfg->humHyst) || !isDoubleFinite(cfg->humOffset)) return 0ULL;
-  if (cfg->humLow >= cfg->humHigh || cfg->humLow < 0.0 || cfg->humHigh > 100.0) return 0ULL;
+  if ((cfg->humHigh - cfg->humLow) < 0.5 || cfg->humLow < 0.0 || cfg->humHigh > 100.0) return 0ULL;
   if (cfg->humHyst < 0.0 || cfg->humHyst > 35.0) return 0ULL;
   if (cfg->humOffset < -30.0 || cfg->humOffset > 30.0) return 0ULL;
 
   if (cfg->presEnable > 1ULL || cfg->presCondition > COND_INSIDE_RANGE) return 0ULL;
   if (!isDoubleFinite(cfg->presHigh) || !isDoubleFinite(cfg->presLow) ||
       !isDoubleFinite(cfg->presHyst) || !isDoubleFinite(cfg->presOffset)) return 0ULL;
-  if (cfg->presLow >= cfg->presHigh || cfg->presLow < 300.0 || cfg->presHigh > 1100.0) return 0ULL;
+  if ((cfg->presHigh - cfg->presLow) < 0.5 || cfg->presLow < 300.0 || cfg->presHigh > 1100.0) return 0ULL;
   if (cfg->presHyst < 0.0 || cfg->presHyst > 60.0) return 0ULL;
   if (cfg->presOffset < -60.0 || cfg->presOffset > 60.0) return 0ULL;
 
@@ -1616,8 +1657,20 @@ static void writeConfigToNvsNow() {
   g_config.checksum  = computeConfigChecksum(&g_config);
 
   if (g_prefs.begin("bme280_nvs", false)) {
-    g_prefs.putBytes("bank_a", &g_config, sizeof(SystemConfig));
-    g_prefs.putBytes("bank_b", &g_config, sizeof(SystemConfig));
+    SystemConfig verifyBuf;
+    memset(&verifyBuf, 0, sizeof(SystemConfig));
+
+    uint64_t wroteA = (uint64_t)g_prefs.putBytes("bank_a", &g_config, sizeof(SystemConfig));
+    uint64_t okA    = 0ULL;
+    if (wroteA == (uint64_t)sizeof(SystemConfig) &&
+        g_prefs.getBytesLength("bank_a") == sizeof(SystemConfig)) {
+      g_prefs.getBytes("bank_a", &verifyBuf, sizeof(SystemConfig));
+      okA = validateConfig(&verifyBuf);
+    }
+
+    if (okA) {
+      g_prefs.putBytes("bank_b", &g_config, sizeof(SystemConfig));
+    }
     g_prefs.end();
   }
 
@@ -1666,7 +1719,7 @@ static void initStorageAndConfig() {
     if (validA && validB) {
       if (bankA.sequence >= bankB.sequence) {
         g_config = bankA;
-        if (bankA.sequence != bankB.sequence) {
+        if (!configsEqualPayload(&bankA, &bankB) || bankA.sequence != bankB.sequence) {
           g_prefs.putBytes("bank_b", &g_config, sizeof(SystemConfig));
         }
       } else {
@@ -1725,6 +1778,29 @@ static void initRelayHardware() {
   }
 }
 
+static void recomputeCalibratedMetricsFromRaw() {
+  if (!g_state.hasValidSample) return;
+
+  double calT = g_state.rawTempC + g_config.tempOffset;
+  double calH = g_state.rawHumPct + g_config.humOffset;
+  if (calH < 0.0) calH = 0.0;
+  if (calH > 100.0) calH = 100.0;
+  double calP = g_state.rawPresHpa + g_config.presOffset;
+  if (calP < 100.0) calP = 100.0;
+
+  g_state.temperatureC = calT;
+  g_state.temperatureF = (calT * 1.8) + 32.0;
+  g_state.humidityPct  = calH;
+  g_state.pressureHpa  = calP;
+
+  double safeH = (calH < 1.0) ? 1.0 : calH;
+  double a     = 17.625;
+  double b     = 243.04;
+  double alpha = log(safeH / 100.0) + ((a * calT) / (b + calT));
+  g_state.dewPointC = (b * alpha) / (a - alpha);
+  g_state.altitudeM = 44330.0 * (1.0 - pow(calP / 1013.25, 0.1903));
+}
+
 static uint64_t evaluateChannelTrigger(
     uint64_t enabled,
     uint64_t condition,
@@ -1737,36 +1813,37 @@ static uint64_t evaluateChannelTrigger(
     return 0ULL;
   }
 
+  double span = high - low;
+  if (span < 0.01) span = 0.01;
+  double cleanHyst = (hyst < 0.0) ? 0.0 : hyst;
+
   if (condition == COND_ABOVE_HIGH) {
     if (!currentState) {
       return (val >= high) ? 1ULL : 0ULL;
     } else {
-      return (val <= (high - hyst)) ? 0ULL : 1ULL;
+      return (val <= (high - cleanHyst)) ? 0ULL : 1ULL;
     }
   } else if (condition == COND_BELOW_LOW) {
     if (!currentState) {
       return (val <= low) ? 1ULL : 0ULL;
     } else {
-      return (val >= (low + hyst)) ? 0ULL : 1ULL;
+      return (val >= (low + cleanHyst)) ? 0ULL : 1ULL;
     }
   } else if (condition == COND_OUTSIDE_RANGE) {
     if (!currentState) {
       return (val <= low || val >= high) ? 1ULL : 0ULL;
     } else {
-      double relLow  = low + hyst;
-      double relHigh = high - hyst;
-      if (relLow > relHigh) {
-        double mid = (low + high) * 0.5;
-        relLow     = mid;
-        relHigh    = mid;
-      }
+      double maxWindowHyst = span * 0.45;
+      double effHyst       = (cleanHyst > maxWindowHyst) ? maxWindowHyst : cleanHyst;
+      double relLow        = low + effHyst;
+      double relHigh       = high - effHyst;
       return (val >= relLow && val <= relHigh) ? 0ULL : 1ULL;
     }
   } else if (condition == COND_INSIDE_RANGE) {
     if (!currentState) {
       return (val >= low && val <= high) ? 1ULL : 0ULL;
     } else {
-      return (val <= (low - hyst) || val >= (high + hyst)) ? 0ULL : 1ULL;
+      return (val <= (low - cleanHyst) || val >= (high + cleanHyst)) ? 0ULL : 1ULL;
     }
   }
   return 0ULL;
@@ -1775,7 +1852,7 @@ static uint64_t evaluateChannelTrigger(
 static void updateRelaysNonBlocking(uint64_t forceImmediate) {
   const uint64_t nowMs = getMillis64();
 
-  if (g_state.sensorHealthy) {
+  if (g_state.sensorHealthy && g_state.hasValidSample) {
     g_state.tempTriggered = evaluateChannelTrigger(
         g_config.tempEnable,
         g_config.tempCondition,
@@ -1813,7 +1890,7 @@ static void updateRelaysNonBlocking(uint64_t forceImmediate) {
       g_state.relayDesiredState[1] = g_state.humTriggered;
       g_state.relayDesiredState[2] = g_state.presTriggered;
     }
-  } else {
+  } else if (!g_state.sensorHealthy) {
     g_state.tempTriggered = 0ULL;
     g_state.humTriggered  = 0ULL;
     g_state.presTriggered = 0ULL;
@@ -1824,7 +1901,8 @@ static void updateRelaysNonBlocking(uint64_t forceImmediate) {
       g_state.relayDesiredState[2] = 0ULL;
     } else if (g_config.failsafeMode == FAILSAFE_FORCE_ON) {
       if (g_config.relayMode == RELAY_MODE_UNIFIED) {
-        g_state.relayDesiredState[0] = 1ULL;
+        uint64_t anyEnabled = (g_config.tempEnable || g_config.humEnable || g_config.presEnable) ? 1ULL : 0ULL;
+        g_state.relayDesiredState[0] = anyEnabled;
         g_state.relayDesiredState[1] = 0ULL;
         g_state.relayDesiredState[2] = 0ULL;
       } else {
@@ -1856,6 +1934,33 @@ static void updateRelaysNonBlocking(uint64_t forceImmediate) {
   }
 }
 
+static void initOrRecoverI2CBus(uint64_t forceBusClear) {
+  if (forceBusClear) {
+    if (g_state.i2cInitialized) {
+      Wire.end();
+      g_state.i2cInitialized = 0ULL;
+    }
+    pinMode((uint8_t)PIN_I2C_SDA, INPUT_PULLUP);
+    pinMode((uint8_t)PIN_I2C_SCL, OUTPUT);
+    digitalWrite((uint8_t)PIN_I2C_SCL, HIGH);
+    spinWaitMicros64(10ULL);
+    for (uint64_t i = 0ULL; i < 9ULL; i++) {
+      if (digitalRead((uint8_t)PIN_I2C_SDA) == HIGH) {
+        break;
+      }
+      digitalWrite((uint8_t)PIN_I2C_SCL, LOW);
+      spinWaitMicros64(10ULL);
+      digitalWrite((uint8_t)PIN_I2C_SCL, HIGH);
+      spinWaitMicros64(10ULL);
+    }
+  }
+  if (!g_state.i2cInitialized) {
+    Wire.begin((int)PIN_I2C_SDA, (int)PIN_I2C_SCL, 100000U);
+    Wire.setTimeOut(20U);
+    g_state.i2cInitialized = 1ULL;
+  }
+}
+
 static uint64_t probeI2CAddress(uint64_t addr) {
   Wire.beginTransmission((uint8_t)addr);
   uint64_t err = (uint64_t)Wire.endTransmission();
@@ -1863,6 +1968,7 @@ static uint64_t probeI2CAddress(uint64_t addr) {
 }
 
 static uint64_t tryInitBME280() {
+  initOrRecoverI2CBus(0ULL);
   const uint64_t candidates[2] = { 0x76ULL, 0x77ULL };
   for (uint64_t i = 0ULL; i < 2ULL; i++) {
     uint64_t addr = candidates[i];
@@ -1878,11 +1984,13 @@ static uint64_t tryInitBME280() {
         g_state.activeI2CAddress        = addr;
         g_state.sensorHealthy           = 1ULL;
         g_state.consecutiveSensorErrors = 0ULL;
+        g_state.sensorWarmupUntilMs     = getMillis64() + BME_WARMUP_DELAY_MS;
         return 1ULL;
       }
     }
   }
-  g_state.sensorHealthy = 0ULL;
+  g_state.sensorHealthy  = 0ULL;
+  g_state.hasValidSample = 0ULL;
   return 0ULL;
 }
 
@@ -1892,8 +2000,9 @@ static void pollBME280NonBlocking() {
   if (!g_state.sensorHealthy) {
     if (g_state.lastSensorInitTryMs == 0ULL || (nowMs - g_state.lastSensorInitTryMs) >= BME_RECOVERY_RETRY_MS) {
       g_state.lastSensorInitTryMs = nowMs;
-      Wire.begin((int)PIN_I2C_SDA, (int)PIN_I2C_SCL, 100000U);
-      Wire.setTimeOut(20U);
+      if (g_state.totalSensorFaults > 0ULL) {
+        initOrRecoverI2CBus(1ULL);
+      }
       if (!tryInitBME280()) {
         updateRelaysNonBlocking(0ULL);
         return;
@@ -1901,6 +2010,10 @@ static void pollBME280NonBlocking() {
     } else {
       return;
     }
+  }
+
+  if (nowMs < g_state.sensorWarmupUntilMs) {
+    return;
   }
 
   if (g_state.lastSensorPollMs != 0ULL && (nowMs - g_state.lastSensorPollMs) < g_config.sensorPollMs) {
@@ -1912,15 +2025,16 @@ static void pollBME280NonBlocking() {
     g_state.consecutiveSensorErrors += 1ULL;
     g_state.totalSensorFaults       += 1ULL;
     if (g_state.consecutiveSensorErrors >= 3ULL) {
-      g_state.sensorHealthy = 0ULL;
+      g_state.sensorHealthy  = 0ULL;
+      g_state.hasValidSample = 0ULL;
     }
     updateRelaysNonBlocking(0ULL);
     return;
   }
 
   double rawT = (double)g_bme.readTemperature();
-  double rawH = (double)g_bme.readHumidity();
   double rawP = (double)g_bme.readPressure() / 100.0;
+  double rawH = (double)g_bme.readHumidity();
 
   uint64_t validRead = 1ULL;
   if (!isDoubleFinite(rawT) || rawT < -45.0 || rawT > 90.0) validRead = 0ULL;
@@ -1931,7 +2045,8 @@ static void pollBME280NonBlocking() {
     g_state.consecutiveSensorErrors += 1ULL;
     g_state.totalSensorFaults       += 1ULL;
     if (g_state.consecutiveSensorErrors >= 3ULL) {
-      g_state.sensorHealthy = 0ULL;
+      g_state.sensorHealthy  = 0ULL;
+      g_state.hasValidSample = 0ULL;
     }
     updateRelaysNonBlocking(0ULL);
     return;
@@ -1939,32 +2054,19 @@ static void pollBME280NonBlocking() {
 
   g_state.consecutiveSensorErrors = 0ULL;
   g_state.sensorHealthy           = 1ULL;
+  g_state.hasValidSample          = 1ULL;
   g_state.totalSensorReads       += 1ULL;
 
-  double calT = rawT + g_config.tempOffset;
-  double calH = rawH + g_config.humOffset;
-  if (calH < 0.0) calH = 0.0;
-  if (calH > 100.0) calH = 100.0;
-  double calP = rawP + g_config.presOffset;
+  g_state.rawTempC   = rawT;
+  g_state.rawHumPct  = rawH;
+  g_state.rawPresHpa = rawP;
 
-  g_state.temperatureC = calT;
-  g_state.temperatureF = (calT * 1.8) + 32.0;
-  g_state.humidityPct  = calH;
-  g_state.pressureHpa  = calP;
-
-  double safeH = (calH < 1.0) ? 1.0 : calH;
-  double a     = 17.625;
-  double b     = 243.04;
-  double alpha = log(safeH / 100.0) + ((a * calT) / (b + calT));
-  g_state.dewPointC = (b * alpha) / (a - alpha);
-  g_state.altitudeM = 44330.0 * (1.0 - pow(calP / 1013.25, 0.1903));
-
+  recomputeCalibratedMetricsFromRaw();
   updateRelaysNonBlocking(0ULL);
 }
 
 static void startOrReloadWiFiAP() {
   WiFi.persistent(false);
-  WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.softAPConfig(g_apIP, g_apIP, g_netMask);
@@ -2031,9 +2133,10 @@ static void sendNoCacheHeaders() {
 }
 
 static uint64_t isCaptiveRedirectRequired() {
-  String host = g_webServer.hostHeader();
-  if (host.length() == 0) return 0ULL;
-  if (host.equals("192.168.4.1") || host.equals("192.168.4.1:80")) {
+  const String& host = g_webServer.hostHeader();
+  const char*   h    = host.c_str();
+  if (h == nullptr || h[0] == '\0') return 0ULL;
+  if (strcmp(h, "192.168.4.1") == 0 || strcmp(h, "192.168.4.1:80") == 0) {
     return 0ULL;
   }
   return 1ULL;
@@ -2054,6 +2157,11 @@ static void handleRootPage() {
   g_webServer.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
 }
 
+static void handleFavicon() {
+  sendNoCacheHeaders();
+  g_webServer.send(204, "image/x-icon", "");
+}
+
 static void handleApiStatus() {
   const uint64_t nowMs     = getMillis64();
   uint64_t       btnHoldMs = 0ULL;
@@ -2070,6 +2178,7 @@ static void handleApiStatus() {
       "{"
       "\"uptimeMs\":%llu,"
       "\"sensorHealthy\":%llu,"
+      "\"hasSample\":%llu,"
       "\"i2cAddr\":%llu,"
       "\"sensorReads\":%llu,"
       "\"sensorFaults\":%llu,"
@@ -2116,33 +2225,34 @@ static void handleApiStatus() {
       "}",
       (unsigned long long)nowMs,
       (unsigned long long)g_state.sensorHealthy,
+      (unsigned long long)g_state.hasValidSample,
       (unsigned long long)g_state.activeI2CAddress,
       (unsigned long long)g_state.totalSensorReads,
       (unsigned long long)g_state.totalSensorFaults,
       (unsigned long long)g_config.sensorPollMs,
-      g_state.temperatureC,
-      g_state.temperatureF,
-      g_state.humidityPct,
-      g_state.pressureHpa,
-      g_state.dewPointC,
-      g_state.altitudeM,
+      safeJsonDouble(g_state.temperatureC),
+      safeJsonDouble(g_state.temperatureF),
+      safeJsonDouble(g_state.humidityPct),
+      safeJsonDouble(g_state.pressureHpa),
+      safeJsonDouble(g_state.dewPointC),
+      safeJsonDouble(g_state.altitudeM),
       (unsigned long long)g_config.tempEnable,
       (unsigned long long)g_config.tempCondition,
-      g_config.tempHigh,
-      g_config.tempLow,
-      g_config.tempOffset,
+      safeJsonDouble(g_config.tempHigh),
+      safeJsonDouble(g_config.tempLow),
+      safeJsonDouble(g_config.tempOffset),
       (unsigned long long)g_state.tempTriggered,
       (unsigned long long)g_config.humEnable,
       (unsigned long long)g_config.humCondition,
-      g_config.humHigh,
-      g_config.humLow,
-      g_config.humOffset,
+      safeJsonDouble(g_config.humHigh),
+      safeJsonDouble(g_config.humLow),
+      safeJsonDouble(g_config.humOffset),
       (unsigned long long)g_state.humTriggered,
       (unsigned long long)g_config.presEnable,
       (unsigned long long)g_config.presCondition,
-      g_config.presHigh,
-      g_config.presLow,
-      g_config.presOffset,
+      safeJsonDouble(g_config.presHigh),
+      safeJsonDouble(g_config.presLow),
+      safeJsonDouble(g_config.presOffset),
       (unsigned long long)g_state.presTriggered,
       (unsigned long long)g_config.relayMode,
       (unsigned long long)g_config.relayActiveLow,
@@ -2222,22 +2332,22 @@ static void handleApiGetSettings() {
       (unsigned long long)g_config.sensorPollMs,
       (unsigned long long)g_config.tempEnable,
       (unsigned long long)g_config.tempCondition,
-      g_config.tempHigh,
-      g_config.tempLow,
-      g_config.tempHyst,
-      g_config.tempOffset,
+      safeJsonDouble(g_config.tempHigh),
+      safeJsonDouble(g_config.tempLow),
+      safeJsonDouble(g_config.tempHyst),
+      safeJsonDouble(g_config.tempOffset),
       (unsigned long long)g_config.humEnable,
       (unsigned long long)g_config.humCondition,
-      g_config.humHigh,
-      g_config.humLow,
-      g_config.humHyst,
-      g_config.humOffset,
+      safeJsonDouble(g_config.humHigh),
+      safeJsonDouble(g_config.humLow),
+      safeJsonDouble(g_config.humHyst),
+      safeJsonDouble(g_config.humOffset),
       (unsigned long long)g_config.presEnable,
       (unsigned long long)g_config.presCondition,
-      g_config.presHigh,
-      g_config.presLow,
-      g_config.presHyst,
-      g_config.presOffset,
+      safeJsonDouble(g_config.presHigh),
+      safeJsonDouble(g_config.presLow),
+      safeJsonDouble(g_config.presHyst),
+      safeJsonDouble(g_config.presOffset),
       (unsigned long long)g_config.wifiChannel,
       (unsigned long long)g_config.wifiHidden,
       (unsigned long long)g_config.wifiMaxConn,
@@ -2267,33 +2377,56 @@ static void handleApiPostSettings() {
     return;
   }
 
+  int64_t relayMode        = doc["relayMode"]        | (int64_t)g_config.relayMode;
+  int64_t relayActiveLow   = doc["relayActiveLow"]   | (int64_t)g_config.relayActiveLow;
+  int64_t failsafeMode     = doc["failsafeMode"]     | (int64_t)g_config.failsafeMode;
+  int64_t minRelaySwitchMs = doc["minRelaySwitchMs"] | (int64_t)g_config.minRelaySwitchMs;
+  int64_t sensorPollMs     = doc["sensorPollMs"]     | (int64_t)g_config.sensorPollMs;
+
+  int64_t tempEnable       = doc["tempEnable"]       | (int64_t)g_config.tempEnable;
+  int64_t tempCondition    = doc["tempCondition"]    | (int64_t)g_config.tempCondition;
+  int64_t humEnable        = doc["humEnable"]        | (int64_t)g_config.humEnable;
+  int64_t humCondition     = doc["humCondition"]     | (int64_t)g_config.humCondition;
+  int64_t presEnable       = doc["presEnable"]       | (int64_t)g_config.presEnable;
+  int64_t presCondition    = doc["presCondition"]    | (int64_t)g_config.presCondition;
+
+  if (relayMode < 0LL || relayActiveLow < 0LL || failsafeMode < 0LL ||
+      minRelaySwitchMs < 0LL || sensorPollMs < 250LL ||
+      tempEnable < 0LL || tempCondition < 0LL ||
+      humEnable < 0LL  || humCondition < 0LL  ||
+      presEnable < 0LL || presCondition < 0LL) {
+    sendNoCacheHeaders();
+    g_webServer.send(400, "application/json", "{\"ok\":0,\"error\":\"Negative or invalid control parameters\"}");
+    return;
+  }
+
   SystemConfig cand     = g_config;
-  cand.relayMode        = (uint64_t)(doc["relayMode"]        | cand.relayMode);
-  cand.relayActiveLow   = (uint64_t)(doc["relayActiveLow"]   | cand.relayActiveLow);
-  cand.failsafeMode     = (uint64_t)(doc["failsafeMode"]     | cand.failsafeMode);
-  cand.minRelaySwitchMs = (uint64_t)(doc["minRelaySwitchMs"] | cand.minRelaySwitchMs);
-  cand.sensorPollMs     = (uint64_t)(doc["sensorPollMs"]     | cand.sensorPollMs);
+  cand.relayMode        = (uint64_t)relayMode;
+  cand.relayActiveLow   = (uint64_t)relayActiveLow;
+  cand.failsafeMode     = (uint64_t)failsafeMode;
+  cand.minRelaySwitchMs = (uint64_t)minRelaySwitchMs;
+  cand.sensorPollMs     = (uint64_t)sensorPollMs;
 
-  cand.tempEnable       = (uint64_t)(doc["tempEnable"]       | cand.tempEnable);
-  cand.tempCondition    = (uint64_t)(doc["tempCondition"]    | cand.tempCondition);
-  cand.tempHigh         = (double)(doc["tempHigh"]           | cand.tempHigh);
-  cand.tempLow          = (double)(doc["tempLow"]            | cand.tempLow);
-  cand.tempHyst         = (double)(doc["tempHyst"]           | cand.tempHyst);
-  cand.tempOffset       = (double)(doc["tempOffset"]         | cand.tempOffset);
+  cand.tempEnable       = (uint64_t)tempEnable;
+  cand.tempCondition    = (uint64_t)tempCondition;
+  cand.tempHigh         = (double)(doc["tempHigh"]   | cand.tempHigh);
+  cand.tempLow          = (double)(doc["tempLow"]    | cand.tempLow);
+  cand.tempHyst         = (double)(doc["tempHyst"]   | cand.tempHyst);
+  cand.tempOffset       = (double)(doc["tempOffset"] | cand.tempOffset);
 
-  cand.humEnable        = (uint64_t)(doc["humEnable"]        | cand.humEnable);
-  cand.humCondition     = (uint64_t)(doc["humCondition"]     | cand.humCondition);
-  cand.humHigh          = (double)(doc["humHigh"]            | cand.humHigh);
-  cand.humLow           = (double)(doc["humLow"]             | cand.humLow);
-  cand.humHyst          = (double)(doc["humHyst"]            | cand.humHyst);
-  cand.humOffset        = (double)(doc["humOffset"]          | cand.humOffset);
+  cand.humEnable        = (uint64_t)humEnable;
+  cand.humCondition     = (uint64_t)humCondition;
+  cand.humHigh          = (double)(doc["humHigh"]    | cand.humHigh);
+  cand.humLow           = (double)(doc["humLow"]     | cand.humLow);
+  cand.humHyst          = (double)(doc["humHyst"]    | cand.humHyst);
+  cand.humOffset        = (double)(doc["humOffset"]  | cand.humOffset);
 
-  cand.presEnable       = (uint64_t)(doc["presEnable"]       | cand.presEnable);
-  cand.presCondition    = (uint64_t)(doc["presCondition"]    | cand.presCondition);
-  cand.presHigh         = (double)(doc["presHigh"]           | cand.presHigh);
-  cand.presLow          = (double)(doc["presLow"]            | cand.presLow);
-  cand.presHyst         = (double)(doc["presHyst"]           | cand.presHyst);
-  cand.presOffset       = (double)(doc["presOffset"]         | cand.presOffset);
+  cand.presEnable       = (uint64_t)presEnable;
+  cand.presCondition    = (uint64_t)presCondition;
+  cand.presHigh         = (double)(doc["presHigh"]   | cand.presHigh);
+  cand.presLow          = (double)(doc["presLow"]    | cand.presLow);
+  cand.presHyst         = (double)(doc["presHyst"]   | cand.presHyst);
+  cand.presOffset       = (double)(doc["presOffset"] | cand.presOffset);
 
   cand.checksum         = computeConfigChecksum(&cand);
 
@@ -2303,7 +2436,12 @@ static void handleApiPostSettings() {
     return;
   }
 
+  if (cand.tempCondition != g_config.tempCondition) g_state.tempTriggered = 0ULL;
+  if (cand.humCondition  != g_config.humCondition)  g_state.humTriggered  = 0ULL;
+  if (cand.presCondition != g_config.presCondition) g_state.presTriggered = 0ULL;
+
   stageConfigSave(&cand, 0ULL);
+  recomputeCalibratedMetricsFromRaw();
   g_state.lastSensorPollMs = 0ULL;
   pollBME280NonBlocking();
   updateRelaysNonBlocking(1ULL);
@@ -2348,15 +2486,25 @@ static void handleApiPostWifi() {
     return;
   }
 
+  int64_t wifiChannel = doc["wifiChannel"] | (int64_t)g_config.wifiChannel;
+  int64_t wifiMaxConn = doc["wifiMaxConn"] | (int64_t)g_config.wifiMaxConn;
+  int64_t wifiHidden  = doc["wifiHidden"]  | (int64_t)g_config.wifiHidden;
+
+  if (wifiChannel < 1LL || wifiChannel > 13LL || wifiMaxConn < 1LL || wifiMaxConn > 4LL || wifiHidden < 0LL || wifiHidden > 1LL) {
+    sendNoCacheHeaders();
+    g_webServer.send(400, "application/json", "{\"ok\":0,\"error\":\"Invalid Wi-Fi channel or client limit\"}");
+    return;
+  }
+
   SystemConfig cand = g_config;
   memset(cand.wifiSsid, 0, sizeof(cand.wifiSsid));
   memset(cand.wifiPass, 0, sizeof(cand.wifiPass));
   strncpy(cand.wifiSsid, newSsid, sizeof(cand.wifiSsid) - 1U);
   strncpy(cand.wifiPass, newPass, sizeof(cand.wifiPass) - 1U);
 
-  cand.wifiChannel = (uint64_t)(doc["wifiChannel"] | cand.wifiChannel);
-  cand.wifiMaxConn = (uint64_t)(doc["wifiMaxConn"] | cand.wifiMaxConn);
-  cand.wifiHidden  = (uint64_t)(doc["wifiHidden"]  | cand.wifiHidden);
+  cand.wifiChannel = (uint64_t)wifiChannel;
+  cand.wifiMaxConn = (uint64_t)wifiMaxConn;
+  cand.wifiHidden  = (uint64_t)wifiHidden;
   cand.checksum    = computeConfigChecksum(&cand);
 
   if (!validateConfig(&cand)) {
@@ -2395,10 +2543,11 @@ static void handleApiReboot() {
 }
 
 static void setupWebServerRoutes() {
-  g_webServer.on("/",          HTTP_GET, handleRootPage);
-  g_webServer.on("/dashboard", HTTP_GET, handleRootPage);
-  g_webServer.on("/settings",  HTTP_GET, handleRootPage);
-  g_webServer.on("/wifi",      HTTP_GET, handleRootPage);
+  g_webServer.on("/",            HTTP_GET, handleRootPage);
+  g_webServer.on("/dashboard",   HTTP_GET, handleRootPage);
+  g_webServer.on("/settings",    HTTP_GET, handleRootPage);
+  g_webServer.on("/wifi",        HTTP_GET, handleRootPage);
+  g_webServer.on("/favicon.ico", HTTP_GET, handleFavicon);
 
   g_webServer.on("/generate_204",              HTTP_GET, sendCaptivePortalRedirect);
   g_webServer.on("/gen_204",                   HTTP_GET, sendCaptivePortalRedirect);
@@ -2409,6 +2558,7 @@ static void setupWebServerRoutes() {
   g_webServer.on("/redirect",                  HTTP_GET, sendCaptivePortalRedirect);
   g_webServer.on("/success.txt",               HTTP_GET, sendCaptivePortalRedirect);
   g_webServer.on("/canonical.html",            HTTP_GET, sendCaptivePortalRedirect);
+  g_webServer.on("/check_network_status.txt",  HTTP_GET, sendCaptivePortalRedirect);
 
   g_webServer.on("/api/status",   HTTP_GET,  handleApiStatus);
   g_webServer.on("/api/settings", HTTP_GET,  handleApiGetSettings);
@@ -2465,17 +2615,17 @@ static void initWatchdogTimer() {
 }
 
 void setup() {
+  esp_log_level_set("*", ESP_LOG_NONE);
   memset(&g_state, 0, sizeof(RuntimeState));
 
   pinMode((uint8_t)PIN_FACTORY_RESET_BTN, INPUT_PULLUP);
   initStorageAndConfig();
   initRelayHardware();
 
-  Wire.begin((int)PIN_I2C_SDA, (int)PIN_I2C_SCL, 100000U);
-  Wire.setTimeOut(20U);
+  initOrRecoverI2CBus(0ULL);
   tryInitBME280();
-  pollBME280NonBlocking();
 
+  WiFi.useStaticBuffers(true);
   startOrReloadWiFiAP();
   setupWebServerRoutes();
   initWatchdogTimer();
