@@ -36,6 +36,8 @@ jobs:
         # Install libraries
         arduino-cli lib install "Adafruit BME280 Library"
         arduino-cli lib install "Adafruit Unified Sensor"
+        arduino-cli lib install "ESP Async WebServer" 
+        arduino-cli lib install "ESP Async TCP"
         
         # Compile firmware
         cd ESP8266
