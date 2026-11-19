@@ -1,117 +1,43 @@
-## 1. Arduino IDE Setup
+## What it does
+A local-only Wi-Fi access point that reads a BME280 sensor and controls up to three relays based on configurable temperature, humidity, and pressure thresholds. No cloud connection.
 
-**Board Manager:**
-- Install **ESP8266** core: `File → Preferences → Additional Boards Manager URLs` → add:
-  ```
-  http://arduino.esp8266.com/stable/package_esp8266com_index.json
-  ```
-- `Tools → Board → Boards Manager` → search `esp8266` → install **ESP8266 by ESP8266 Community** (v3.x)
+## Hardware wiring
+| Signal | ESP8266 pin | GPIO |
+|---|---|---|
+| BME280 SDA | D1 | 5 |
+| BME280 SCL | D2 | 4 |
+| Relay 1 (temp/unified) | D5 | 14 |
+| Relay 2 (humidity) | D6 | 12 |
+| Relay 3 (pressure) | D7 | 13 |
+| Factory reset button | D3 | 0 (to GND) |
 
-**Libraries** (`Tools → Manage Libraries`):
-- **Adafruit BME280 Library** (by Adafruit)
-- **Adafruit Unified Sensor** (dependency — IDE will prompt, install it)
+- Power the BME280 from **3.3 V** (not 5 V).
+- Default relay polarity is **active LOW** (typical relay modules). Change it in the UI if your board is active HIGH.
+- Do **not** hold the D3/GPIO0 button while powering on — it must be HIGH at boot for normal startup.
 
-## 2. Board Settings (`Tools` menu)
+## First-time use
+1. Flash the sketch and open the Serial Monitor at 115200 baud (optional).
+2. On your phone/PC, connect to Wi-Fi network **ESP8266_BME280** with password **12345678**.
+3. Open **http://192.168.4.1** in a browser.
+4. Go to **Wi-Fi access point** and change the default password immediately.
 
-| Setting | Value |
-|---|---|
-| Board | **NodeMCU 1.0 (ESP-12E Module)** (or your board) |
-| Flash Size | **4MB (FS:none OTA:~1019KB)** — required for OTA |
-| CPU Frequency | 80 MHz |
-| Upload Speed | 115200 |
-| Port | your COM/tty port |
+## Pages
+- **Overview** — live readings, relay state, device health, and a "Re-scan sensor" button.
+- **Sensor & relay** — set relay mode (unified vs. individual), polarity, fault behavior, sampling interval (1–60 s), and per-sensor alarm bands with hysteresis.
+- **Wi-Fi access point** — change SSID, channel (1–13), and WPA2 password. Saving restarts the AP.
 
-> OTA needs ≥1 MB free for the update partition. `4MB (FS:none OTA:~1019KB)` is the standard choice.
+## Relay modes
+- **Unified** (default): any enabled alarm drives D5 only; D6/D7 stay off.
+- **Individual**: temperature → D5, humidity → D6, pressure → D7.
 
-## 3. Wiring
+## Factory reset
+While the device is running, hold the D3/GPIO0 button for **5 seconds**. Defaults are restored and the AP restarts.
 
-| BME280 | NodeMCU |
-|---|---|
-| VCC | 3V3 |
-| GND | GND |
-| SDA | **D2** (GPIO4) |
-| SCL | **D1** (GPIO5) |
-| SDO | GND → `0x76`, or 3V3 → `0x77` |
+## Troubleshooting
+- **Sensor not detected**: check 3.3 V power, SDA/SCL wiring, and that the module is at address 0x76 or 0x77. Use "Re-scan sensor" after fixing.
+- **Relays behave inverted**: switch "Relay input polarity" in Sensor & relay settings.
+- **Settings won't save**: LittleFS may be unavailable (wrong flash partition scheme). Select a partition scheme with SPIFFS/LittleFS in the Arduino IDE.
+- **Captive portal doesn't open automatically**: some HTTPS pages can't be redirected; navigate directly to http://192.168.4.1.
 
-| Relay | NodeMCU |
-|---|---|
-| IN | **D6** (GPIO12) |
-| VCC | 3V3 or 5V (per module) |
-| GND | GND |
-
-> **BOOT button (GPIO0)** is on-board — no wiring needed. Hold 5 s to factory reset.
-
-## 4. First Flash (USB)
-
-1. Paste the full code into a new `.ino` sketch (name it `ESP8266_BME280.ino`).
-2. `Sketch → Verify` — expect **no errors**.
-3. Connect board via USB, select the correct **Port**.
-4. Click **Upload**. If it fails with `espcomm_upload_mem failed`, hold **BOOT** while the upload starts, release after "Connecting...".
-5. Open **Serial Monitor @ 115200** — after boot you'll see the AP come up.
-
-## 5. First Connection
-
-1. On phone/PC, scan WiFi → join **`ESP8266_BME280`** / password **`12345678`**.
-2. A captive-portal page opens automatically. If not, browse to **`http://192.168.4.1`**.
-3. You should see the dashboard with live temp/hum/pressure.
-
-## 6. Configuration
-
-**`/settings`** — relay mode, thresholds, sample interval, I2C address.
-- Changes persist **immediately** to flash.
-- Changing I2C address re-initializes the sensor automatically.
-
-**`/wifi`** — AP SSID, password (min 8 chars or empty = open), channel, hidden, max clients.
-- Saving **reboots the device**. Reconnect with the new SSID/password.
-
-## 7. Factory Reset
-
-- **Button:** Hold on-board **BOOT** for 5 s → device resets to defaults and reboots.
-- **Web:** `/settings` → **Factory Reset** button.
-
-Defaults: SSID `ESP8266_BME280`, pass `12345678`, mode Manual, relay ON.
-
-## 8. OTA Firmware Update
-
-Once connected to the AP:
-
-1. Browse to **`http://192.168.4.1/update`**
-2. Select a compiled `.bin` file (`Sketch → Export Compiled Binary` creates it).
-3. Click **Update** → device reboots into new firmware.
-
-> OTA requires the **4MB OTA** flash layout from step 2.
-
-## 9. Verifying It Works
-
-- **Dashboard** (`/`) refreshes every 2 s.
-- **Sensor: OK** in status = sensor responding and data valid.
-- **Sensor: FAIL** = sensor not found or unplugged (relay modes 1–4 will hold relay OFF after ~15 s).
-- **`/api/status`** returns JSON — useful for `curl`/Home Assistant:
-  ```bash
-  curl http://192.168.4.1/api/status
-  ```
-
-## 10. Common Issues
-
-| Symptom | Fix |
-|---|---|
-| Can't upload | Hold **BOOT** during "Connecting..." |
-| Sensor reads `--` | Check wiring; try I2C address `0x77` in `/settings` |
-| Sensor: FAIL forever | BME280 not powered (3.3V only) or SDA/SCL swapped |
-| Relay never clicks | Ensure mode 0 (Manual) or thresholds crossed; relay is **active HIGH** |
-| Can't reach `192.168.4.1` | Reconnect WiFi; DNS portal may need manual IP |
-| Settings reset after power cycle | Verify flash layout is OTA 4MB, then re-save once |
-| OTA fails | Confirm flash layout allows OTA (see step 2) |
-
-## 11. Quick Reference
-
-| URL | Purpose |
-|---|---|
-| `/` | Dashboard |
-| `/settings` | Sensor/relay config |
-| `/wifi` | AP config (reboots on save) |
-| `/update` | OTA firmware upload |
-| `/api/status` | JSON status |
-| `/api/settings` POST | Programmatic settings |
-| `/api/wifi` POST | Programmatic AP config |
-| `/api/factoryreset` POST | Factory reset |
+## Safety note
+This is **not** a safety-rated fail-safe controller. Choose the "when BME280 data is unavailable" behavior based on your external circuit, and use a proper relay driver board — do not drive relay coils directly from GPIOs.
