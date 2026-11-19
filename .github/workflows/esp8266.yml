@@ -38,6 +38,7 @@ jobs:
         arduino-cli lib install "Adafruit Unified Sensor"
         arduino-cli lib install "ESP Async WebServer" 
         arduino-cli lib install "ESP Async TCP"
+        arduino-cli lib install "Adafruit BusIO"
         
         # Compile firmware
         cd ESP8266
