@@ -1,43 +1,59 @@
-## What it does
-A local-only Wi-Fi access point that reads a BME280 sensor and controls up to three relays based on configurable temperature, humidity, and pressure thresholds. No cloud connection.
+## 1. Hardware Wiring
 
-## Hardware wiring
-| Signal | ESP8266 pin | GPIO |
-|---|---|---|
-| BME280 SDA | D1 | 5 |
-| BME280 SCL | D2 | 4 |
-| Relay 1 (temp/unified) | D5 | 14 |
-| Relay 2 (humidity) | D6 | 12 |
-| Relay 3 (pressure) | D7 | 13 |
-| Factory reset button | D3 | 0 (to GND) |
+| Device / Module | Pin Name | ESP8266 GPIO | Board Pin (NodeMCU / Wemos D1) | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **BME280 Sensor** | **SDA** | **GPIO 5** | **D1** | I2C Data line |
+| **BME280 Sensor** | **SCL** | **GPIO 4** | **D2** | I2C Clock line |
+| **BME280 Sensor** | **VCC / GND** | — | **3.3V / GND** | Sensor power ($3.3\text{V}$ only) |
+| **Relay 1** | **IN1** | **GPIO 14** | **D5** | **Unified Mode** (all sensors) or **Temp** |
+| **Relay 2** | **IN2** | **GPIO 12** | **D6** | **Individual Mode** (Humidity) |
+| **Relay 3** | **IN3** | **GPIO 13** | **D7** | **Individual Mode** (Pressure) |
+| **Reset Button** | **BOOT / FLASH**| **GPIO 0** | **D3** | Onboard button (Hold $\ge 5\text{s}$ for factory reset) |
 
-- Power the BME280 from **3.3 V** (not 5 V).
-- Default relay polarity is **active LOW** (typical relay modules). Change it in the UI if your board is active HIGH.
-- Do **not** hold the D3/GPIO0 button while powering on — it must be HIGH at boot for normal startup.
+---
 
-## First-time use
-1. Flash the sketch and open the Serial Monitor at 115200 baud (optional).
-2. On your phone/PC, connect to Wi-Fi network **ESP8266_BME280** with password **12345678**.
-3. Open **http://192.168.4.1** in a browser.
-4. Go to **Wi-Fi access point** and change the default password immediately.
+## 2. Arduino IDE Setup & Libraries
 
-## Pages
-- **Overview** — live readings, relay state, device health, and a "Re-scan sensor" button.
-- **Sensor & relay** — set relay mode (unified vs. individual), polarity, fault behavior, sampling interval (1–60 s), and per-sensor alarm bands with hysteresis.
-- **Wi-Fi access point** — change SSID, channel (1–13), and WPA2 password. Saving restarts the AP.
+1. **Install ESP8266 Board Package:**
+   - In Arduino IDE, go to **Settings** $\rightarrow$ **Additional Board Manager URLs**:  
+     `https://arduino.esp8266.com/stable/package_esp8266com_index.json`
+   - Open **Tools** $\rightarrow$ **Board Manager**, search for **`esp8266`**, and install.
+2. **Install Required Libraries** (via **Tools** $\rightarrow$ **Manage Libraries...**):
+   - **`Adafruit BME280 Library`**
+   - **`Adafruit Unified Sensor`**
+   - **`ArduinoJson`** (v6 or v7)
+3. **Board Configuration:**
+   - **Board:** *NodeMCU 1.0 (ESP-12E Module)* or *LOLIN(WEMOS) D1 R2 & mini*
+   - **CPU Frequency:** *80 MHz* or *160 MHz*
+   - **Flash Size:** *4MB (FS:none OTA:~1019KB)* or standard *4MB (FS:2MB)*
+   - **Upload Speed:** *921600* (or *115200*)
 
-## Relay modes
-- **Unified** (default): any enabled alarm drives D5 only; D6/D7 stay off.
-- **Individual**: temperature → D5, humidity → D6, pressure → D7.
+---
 
-## Factory reset
-While the device is running, hold the D3/GPIO0 button for **5 seconds**. Defaults are restored and the AP restarts.
+## 3. Flash the Firmware
 
-## Troubleshooting
-- **Sensor not detected**: check 3.3 V power, SDA/SCL wiring, and that the module is at address 0x76 or 0x77. Use "Re-scan sensor" after fixing.
-- **Relays behave inverted**: switch "Relay input polarity" in Sensor & relay settings.
-- **Settings won't save**: LittleFS may be unavailable (wrong flash partition scheme). Select a partition scheme with SPIFFS/LittleFS in the Arduino IDE.
-- **Captive portal doesn't open automatically**: some HTTPS pages can't be redirected; navigate directly to http://192.168.4.1.
+- Open **`/home/user/esp8266-bme280-controller.ino`** in the Arduino IDE.
+- Connect your ESP8266 via USB, select the corresponding COM/TTY port, and click **Upload**.
 
-## Safety note
-This is **not** a safety-rated fail-safe controller. Choose the "when BME280 data is unavailable" behavior based on your external circuit, and use a proper relay driver board — do not drive relay coils directly from GPIOs.
+---
+
+## 4. Connect & Access Dashboard
+
+1. **Connect to Wi-Fi Access Point:**
+   - **SSID:** `ESP8266_BME280`
+   - **Password:** `12345678`
+2. **Access Web Interface:**
+   - A captive portal popup will appear automatically on your phone or PC.
+   - If it does not auto-open, navigate to: **`http://192.168.4.1/`**
+
+---
+
+## 5. Daily Operation
+
+- **Live Dashboard:** Displays real-time Temperature (°C/°F), Humidity (%RH), Dew Point, Pressure (hPa), Altitude, rolling trend graphs, and relay states.
+- **Relay Modes (Settings Tab):**
+  - **Unified Mode:** Relay 1 (GPIO 14 / D5) activates whenever **any** threshold condition triggers.
+  - **Individual Mode:** Relay 1 (D5) triggers on Temperature, Relay 2 (D6) on Humidity, Relay 3 (D7) on Pressure.
+  - **Polarity:** Select *Active HIGH* or *Active LOW* to match your relay board.
+- **Hardware Factory Reset:**
+  - Hold the onboard **FLASH / BOOT** button (GPIO 0 / D3) for **5 seconds**. All relays will de-energize and settings will revert to defaults (`ESP8266_BME280` / `12345678`).
